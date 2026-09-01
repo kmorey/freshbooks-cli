@@ -21,15 +21,16 @@ Pause and resume are intentionally not exposed yet. FreshBooks supports them in 
 
 ## Install
 
+On Linux or macOS with Node.js 22 or newer:
+
 ```bash
-git clone https://github.com/kmorey/freshbooks-cli.git
-cd freshbooks-cli
-npm install
-npm link
+curl -fsSL https://raw.githubusercontent.com/kmorey/freshbooks-cli/main/install.sh | sh
 freshbooks --help
 ```
 
-There are currently no runtime npm dependencies. `npm install` prepares standard package metadata, and `npm link` makes the `freshbooks` command available on your `PATH`.
+The installer verifies the latest release checksum, installs versioned application files under `~/.local/share/freshbooks-cli`, and places the command at `~/.local/bin/freshbooks`. Running it again upgrades the CLI without touching configuration or credentials.
+
+For an inspect-before-running workflow, pinned versions, custom prefixes, uninstall instructions, Windows/npm installation, and an agent-ready procedure, see [INSTALL.md](INSTALL.md).
 
 ## Requirements
 
@@ -160,6 +161,7 @@ See [SECURITY.md](SECURITY.md) for vulnerability and accidental-disclosure guida
 ## Development
 
 ```bash
+npm install
 npm test
 npm run check
 ```

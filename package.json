@@ -24,12 +24,14 @@
   "files": [
     "bin",
     "src",
+    "install.sh",
+    "INSTALL.md",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "test": "node --test",
-    "check": "node --check bin/freshbooks.js && node --check src/*.js"
+    "check": "node --check bin/freshbooks.js && node --check src/*.js && sh -n install.sh"
   },
   "engines": {
     "node": ">=22"

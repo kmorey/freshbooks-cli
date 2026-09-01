@@ -11,6 +11,8 @@ Maintain a small, dependency-free Node.js CLI for FreshBooks time tracking and s
 3. Run `npm test` and `npm run check`. Completion requires both commands to pass.
 4. Scan changed files for credentials, account identifiers, company/client/project names, emails, and captured API payloads before committing.
 
+When changing installation, packaging, or releases, read `INSTALL.md`; completion requires the local installer tests and a checksum-verified release asset.
+
 ## Invariants
 
 - Keep runtime dependencies at zero unless a dependency materially reduces security or protocol risk.

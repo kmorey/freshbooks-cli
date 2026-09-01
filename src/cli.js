@@ -1,4 +1,5 @@
 import { createInterface } from "node:readline/promises";
+import { createRequire } from "node:module";
 import { stdin as defaultStdin, stdout as defaultStdout } from "node:process";
 import { parseArgs, optionalInteger, requireOption } from "./args.js";
 import { ConfigStore } from "./config.js";
@@ -11,6 +12,9 @@ import { parseDate, parseDuration } from "./format.js";
 import { CliError } from "./errors.js";
 import { runProcess } from "./process.js";
 
+const require = createRequire(import.meta.url);
+const { version: PACKAGE_VERSION } = require("../package.json");
+
 export async function run(argv, dependencies = {}) {
   let parsed;
   try {
@@ -21,6 +25,10 @@ export async function run(argv, dependencies = {}) {
 
   const output = dependencies.output || new Output({ json: parsed.options.json, ...dependencies });
   try {
+    if (parsed.options.version) {
+      output.success({ version: PACKAGE_VERSION }, PACKAGE_VERSION);
+      return 0;
+    }
     if (parsed.options.help || parsed.positionals.length === 0) {
       output.success({ help: HELP }, HELP);
       return 0;
@@ -373,6 +381,7 @@ Usage:
 Options:
   --json       Emit one stable JSON object for Quickshell and scripts
   --help       Show this help
+  --version    Show the installed version
 
 Environment overrides:
   FRESHBOOKS_CLIENT_ID, FRESHBOOKS_CLIENT_SECRET, FRESHBOOKS_REDIRECT_URI

@@ -19,3 +19,7 @@ test("parseArgs supports explicit false boolean options", () => {
 test("parseArgs recognizes include-unlogged as a boolean", () => {
   assert.equal(parseArgs(["time", "list", "--include-unlogged"]).options.includeUnlogged, true);
 });
+
+test("parseArgs recognizes the version flag without a command", () => {
+  assert.equal(parseArgs(["--version"]).options.version, true);
+});

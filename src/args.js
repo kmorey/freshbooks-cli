@@ -8,6 +8,7 @@ const BOOLEAN_OPTIONS = new Set([
   "include-unlogged",
   "json",
   "no-browser",
+  "version",
   "yes",
 ]);
 
