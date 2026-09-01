@@ -1,0 +1,38 @@
+{
+  "name": "freshbooks-cli",
+  "version": "0.1.0",
+  "description": "A FreshBooks time-tracking CLI designed for desktop shell integrations",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kmorey/freshbooks-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kmorey/freshbooks-cli/issues"
+  },
+  "homepage": "https://github.com/kmorey/freshbooks-cli#readme",
+  "keywords": [
+    "freshbooks",
+    "time-tracking",
+    "cli",
+    "omarchy",
+    "quickshell"
+  ],
+  "type": "module",
+  "bin": {
+    "freshbooks": "./bin/freshbooks.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check bin/freshbooks.js && node --check src/*.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}

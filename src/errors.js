@@ -1,0 +1,24 @@
+export class CliError extends Error {
+  constructor(message, { code = "CLI_ERROR", exitCode = 1, details, status } = {}) {
+    super(message);
+    this.name = "CliError";
+    this.code = code;
+    this.exitCode = exitCode;
+    this.details = details;
+    this.status = status;
+  }
+}
+
+export class ApiError extends CliError {
+  constructor(message, { code = "API_ERROR", details, status } = {}) {
+    super(message, { code, details, status, exitCode: status === 401 ? 4 : 3 });
+    this.name = "ApiError";
+  }
+}
+
+export function asCliError(error) {
+  if (error instanceof CliError) return error;
+  return new CliError(error instanceof Error ? error.message : String(error), {
+    code: "UNEXPECTED_ERROR",
+  });
+}
