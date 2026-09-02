@@ -147,7 +147,7 @@ export class FreshBooksService {
     };
   }
 
-  async listTimeEntries(filters = {}) {
+  async listTimeEntries(filters = {}, { limit } = {}) {
     const businessId = await this.businessId();
     const entries = [];
     let page = 1;
@@ -157,10 +157,11 @@ export class FreshBooksService {
         query: { per_page: 100, page, ...filters },
       });
       entries.push(...(payload?.time_entries || []));
+      if (limit && entries.length >= limit) break;
       pages = Number(payload?.meta?.pages || 1);
       page += 1;
     } while (page <= pages);
-    return entries;
+    return limit ? entries.slice(0, limit) : entries;
   }
 
   async timeEntry(entryId) {
@@ -171,8 +172,8 @@ export class FreshBooksService {
     return payload?.time_entry || payload;
   }
 
-  async timeEntryRecords(filters = {}) {
-    return (await this.listTimeEntries(filters))
+  async timeEntryRecords(filters = {}, options = {}) {
+    return (await this.listTimeEntries(filters, options))
       .filter((entry) => entry.is_logged === true)
       .map(presentTimeEntry);
   }
@@ -189,7 +190,7 @@ export class FreshBooksService {
         ...entry,
         client_id: project.client_id ?? null,
         service_id: service.id,
-        billable: service.billable === true,
+        billable: project.internal === true ? false : service.billable === true,
         internal: project.internal === true,
       };
     }
@@ -214,7 +215,7 @@ export class FreshBooksService {
         project_id: projectId,
         client_id: project.client_id ?? null,
         service_id: service.id,
-        billable: service.billable === true,
+        billable: project.internal === true ? false : service.billable === true,
         internal: project.internal === true,
       };
     }
@@ -346,7 +347,7 @@ export class FreshBooksService {
       ...fields,
       client_id: project.client_id ?? null,
       service_id: service?.id ?? fields.service_id ?? null,
-      billable: service?.billable ?? fields.billable ?? false,
+      billable: project.internal === true ? false : (service?.billable ?? fields.billable ?? false),
       internal: project.internal === true,
       is_logged: false,
       started_at: startedAt,
@@ -479,6 +480,15 @@ export class FreshBooksService {
   }
 
   async switchTimer(timerId, fields, { snapshotToken } = {}) {
+    if (!fields.project_id) {
+      throw new CliError("Switching a timer requires a target project", {
+        code: "PROJECT_REQUIRED",
+        exitCode: 2,
+      });
+    }
+    const { project, abilities } = await this.timerProject(fields.project_id);
+    const service = selectProjectService(project, fields.service_id);
+    assertTrackableProject(project, service, abilities);
     let logged = null;
     const timers = await this.activeTimers();
     if (timers.length > 0) logged = await this.logTimer(timerId, { snapshotToken });

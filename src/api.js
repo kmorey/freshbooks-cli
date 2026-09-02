@@ -44,7 +44,12 @@ export class FreshBooksClient {
           outcomeUnknown: method !== "GET",
         });
       }
-      throw error;
+      throw new CliError("FreshBooks API transport failed", {
+        code: "API_TRANSPORT",
+        exitCode: 3,
+        outcomeUnknown: method !== "GET",
+        details: { cause: error instanceof Error ? error.message : String(error) },
+      });
     }
 
     if (response.status === 401 && retryAuth) {
@@ -76,6 +81,7 @@ export class FreshBooksClient {
       throw new ApiError(apiMessage(payload, response.status), {
         status: response.status,
         details: payload,
+        outcomeUnknown: method !== "GET" && response.status >= 500,
       });
     }
     return payload;

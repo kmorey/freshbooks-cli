@@ -73,3 +73,17 @@ test("a timed-out mutation reports an ambiguous outcome", async () => {
     { code: "API_TIMEOUT", outcomeUnknown: true },
   );
 });
+
+test("a mutation transport failure reports an ambiguous outcome", async () => {
+  const configStore = { async read() { return { apiBase: "https://api.freshbooks.test", profile: "default" }; } };
+  const secretStore = { async read() { return { accessToken: "test", expiresAt: "2099-01-01T00:00:00Z" }; } };
+  const client = new FreshBooksClient({
+    configStore,
+    secretStore,
+    fetcher: async () => { throw new TypeError("connection reset"); },
+  });
+  await assert.rejects(
+    client.request("/timetracking/business/123/time_entries/9", { method: "DELETE" }),
+    { code: "API_TRANSPORT", outcomeUnknown: true },
+  );
+});

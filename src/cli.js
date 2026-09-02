@@ -56,6 +56,9 @@ export async function run(argv, dependencies = {}) {
     if (group === "clients") {
       return await clientsCommand({ action, output, service });
     }
+    if (group === "diagnostics") {
+      return await diagnosticsCommand({ action, output, configStore, secretStore });
+    }
     if (group === "timer") {
       return await timerCommand({ action, argument, options: parsed.options, output, service });
     }
@@ -214,6 +217,24 @@ async function clientsCommand({ action, output, service }) {
   return 0;
 }
 
+async function diagnosticsCommand({ action, output, configStore, secretStore }) {
+  if (action !== "status") throw unknownAction("diagnostics", action);
+  const config = await configStore.read();
+  const secrets = await secretStore.read(config.profile);
+  const result = {
+    version: PACKAGE_VERSION,
+    authenticated: Boolean(secrets.accessToken),
+    businessSelected: Boolean(config.businessId),
+    timezone: config.timezone,
+    capabilities: [
+      "clients", "projects", "time-entries", "timer-segments", "timer-switch",
+      "snapshot-guards", "local-calendar", "bounded-history",
+    ],
+  };
+  output.success(result, `freshbooks ${PACKAGE_VERSION}: ${result.authenticated ? "authenticated" : "not authenticated"}`);
+  return 0;
+}
+
 async function timerCommand({ action, argument, options, output, service }) {
   const timerId = optionalInteger(argument ?? options.id, "id");
   if (action === "status") {
@@ -313,12 +334,14 @@ async function timeCommand({ action, argument, options, output, service }) {
       : (/^\d{4}-\d{2}-\d{2}$/.test(options.to)
           ? await service.localRangeBoundary(options.to, { endOfDay: true })
           : parseRangeDate(options.to, "to", { endOfDay: true }));
+    const limit = optionalInteger(options.limit, "limit");
     const entries = await service.timeEntryRecords({
       started_from: from?.toISOString(),
       started_to: to?.toISOString(),
       project_id: optionalInteger(options.project, "project"),
       include_unlogged: options.includeUnlogged,
-    });
+      ...(limit ? { sort: "started_at_desc", per_page: Math.min(100, limit) } : {}),
+    }, { limit });
     output.success(
       entries,
       entries
@@ -425,6 +448,7 @@ Usage:
   freshbooks business use ID
   freshbooks projects list [--all]
   freshbooks clients list
+  freshbooks diagnostics status
   freshbooks timer status
   freshbooks timer start --project ID --service ID [--note TEXT]
   freshbooks timer pause [--id TIMER_ID]
@@ -434,7 +458,7 @@ Usage:
   freshbooks timer log [--id TIMER_ID]
   freshbooks timer switch --project ID --service ID [--id TIMER_ID]
   freshbooks timer discard [--id TIMER_ID] --yes
-  freshbooks time list [--from DATE] [--to DATE] [--project ID]
+  freshbooks time list [--from DATE] [--to DATE] [--project ID] [--limit COUNT]
   freshbooks time add --duration 1h30m [--date YYYY-MM-DD] [--project ID] [--note TEXT]
   freshbooks time update ENTRY_ID [--date YYYY-MM-DD] [--duration 45m] [--note TEXT]
   freshbooks time delete ENTRY_ID --snapshot TOKEN --yes

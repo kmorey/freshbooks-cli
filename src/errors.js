@@ -11,8 +11,8 @@ export class CliError extends Error {
 }
 
 export class ApiError extends CliError {
-  constructor(message, { code = "API_ERROR", details, status } = {}) {
-    super(message, { code, details, status, exitCode: status === 401 ? 4 : 3 });
+  constructor(message, { code = "API_ERROR", details, status, outcomeUnknown = false } = {}) {
+    super(message, { code, details, status, outcomeUnknown, exitCode: status === 401 ? 4 : 3 });
     this.name = "ApiError";
   }
 }

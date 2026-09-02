@@ -111,6 +111,26 @@ test("logged entries derive client and billability from the selected project ser
   assert.match(result.snapshotToken, /^[a-f0-9]{64}$/);
 });
 
+test("internal project time remains non-billable even when its service is billable", async () => {
+  let written;
+  const client = { async request(path, options = {}) {
+    if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
+    if (path === "/comments/business/123/project/44") return {
+      project: { id: 44, client_id: null, internal: true, active: true, complete: false, services: [{ id: 66, billable: true }] },
+      abilities: [{ name: "can_track_time", value: true }],
+    };
+    if (path === "/timetracking/business/123/time_entries" && options.method === "POST") {
+      written = options.body.time_entry;
+      return { time_entry: { id: 9, ...written } };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore });
+  await service.createTimeEntry({ is_logged: true, duration: 60, started_at: "2026-09-02T12:00:00Z", project_id: 44, service_id: 66 });
+  assert.equal(written.billable, false);
+  assert.equal(written.internal, true);
+});
+
 test("startTimer creates a timer identity then assigns project metadata", async () => {
   const requests = [];
   let assigned;
@@ -241,4 +261,23 @@ test("activeTimers makes one identity-scoped bounded request instead of paginati
   assert.equal(requests, 1);
   assert.equal(query.identity_id, 88);
   assert.equal(query.per_page, 100);
+});
+
+test("recent time-entry history stops at the requested bound", async () => {
+  const pages = [];
+  const client = { async request(path, options = {}) {
+    if (!path.endsWith("/time_entries")) throw new Error(`Unexpected request: ${path}`);
+    pages.push(options.query.page);
+    const start = (options.query.page - 1) * 100;
+    return {
+      time_entries: Array.from({ length: 100 }, (_, index) => ({
+        id: start + index + 1, is_logged: true, duration: 1, started_at: "2026-09-02T12:00:00Z",
+      })),
+      meta: { pages: 500 },
+    };
+  } };
+  const service = new FreshBooksService({ client, configStore });
+  const entries = await service.timeEntryRecords({ sort: "started_at_desc" }, { limit: 200 });
+  assert.equal(entries.length, 200);
+  assert.deepEqual(pages, [1, 2]);
 });
