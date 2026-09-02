@@ -226,6 +226,7 @@ async function diagnosticsCommand({ action, output, configStore, secretStore }) 
     authenticated: Boolean(secrets.accessToken),
     businessSelected: Boolean(config.businessId),
     timezone: config.timezone,
+    localDate: todayInTimezone(config.timezone),
     capabilities: [
       "clients", "projects", "time-entries", "timer-segments", "timer-switch",
       "snapshot-guards", "local-calendar", "bounded-history",
@@ -422,6 +423,14 @@ function assertHttpsRedirect(value) {
   if (url.protocol !== "https:") {
     throw new CliError("FreshBooks requires an HTTPS redirect URI", { exitCode: 2 });
   }
+}
+
+function todayInTimezone(timezone) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date()).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
 async function openBrowser(url) {

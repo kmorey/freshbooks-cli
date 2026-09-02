@@ -4,7 +4,7 @@ import { FreshBooksService, groupTimerSegments, presentTimeEntry } from "../src/
 
 const businessId = 123;
 const now = () => new Date("2026-09-01T15:00:00Z");
-const configStore = { async read() { return { businessId }; }, async update() {} };
+const configStore = { async read() { return { businessId, timezone: "America/Chicago" }; }, async update() {} };
 
 function segment(overrides = {}) {
   return {
@@ -49,6 +49,10 @@ test("normalizes project/client joins and logged time entries for plugins", asyn
     durationSeconds: 90, projectId: 44, clientId: null, serviceId: null, note: "Work", billable: false, billed: false, snapshotToken: undefined,
   });
   assert.match(normalized.snapshotToken, /^[a-f0-9]{64}$/);
+  assert.equal(
+    presentTimeEntry({ id: 10, started_at: "2026-09-03T02:00:00Z", duration: 1 }, { timezone: "America/Chicago" }).localDate,
+    "2026-09-02",
+  );
   assert.deepEqual(await service.clientRecords(), [{
     id: 55, name: "Example Client", organization: "Example Client", active: true,
   }]);
@@ -157,6 +161,7 @@ test("startTimer creates a timer identity then assigns project metadata", async 
   assert.equal(assign.body.time_entry.project_id, 44);
   assert.equal(assign.body.time_entry.service_id, 66);
   assert.equal(assign.body.time_entry.billable, true);
+  assert.equal(assign.body.time_entry.local_timezone, "America/Chicago");
   assert.equal(timer.id, 901);
   assert.deepEqual(timer.segmentIds, [900]);
 });

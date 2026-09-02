@@ -173,9 +173,10 @@ export class FreshBooksService {
   }
 
   async timeEntryRecords(filters = {}, options = {}) {
+    const timezone = (await this.configStore.read()).timezone;
     return (await this.listTimeEntries(filters, options))
       .filter((entry) => entry.is_logged === true)
-      .map(presentTimeEntry);
+      .map((entry) => presentTimeEntry(entry, { timezone }));
   }
 
   async createTimeEntry(fields) {
@@ -198,7 +199,8 @@ export class FreshBooksService {
       method: "POST",
       body: { time_entry: compact(entry) },
     });
-    return presentTimeEntry(payload?.time_entry || payload);
+    const timezone = (await this.configStore.read()).timezone;
+    return presentTimeEntry(payload?.time_entry || payload, { timezone });
   }
 
   async updateTimeEntry(entryId, patch, { snapshotToken } = {}) {
@@ -225,7 +227,8 @@ export class FreshBooksService {
       `/timetracking/business/${businessId}/time_entries/${entryId}`,
       { method: "PUT", body: { time_entry: entry } },
     );
-    return presentTimeEntry(payload?.time_entry || payload);
+    const timezone = (await this.configStore.read()).timezone;
+    return presentTimeEntry(payload?.time_entry || payload, { timezone });
   }
 
   async deleteTimeEntry(entryId, { snapshotToken } = {}) {
@@ -339,6 +342,7 @@ export class FreshBooksService {
     }
     const businessId = await this.businessId();
     const identity = await this.identity();
+    const timezone = (await this.configStore.read()).timezone;
     const { project, abilities } = await this.timerProject(fields.project_id);
     const service = selectProjectService(project, fields.service_id);
     assertTrackableProject(project, service, abilities);
@@ -352,7 +356,7 @@ export class FreshBooksService {
       is_logged: false,
       started_at: startedAt,
       local_started_at: fields.local_started_at ?? null,
-      local_timezone: fields.local_timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
+      local_timezone: fields.local_timezone ?? timezone,
       duration: null,
     });
     const createdPayload = await this.client.request(
@@ -471,8 +475,9 @@ export class FreshBooksService {
       body: { timer: { time_entries: timer._segments.map((segment) => timerEntryFields(segment)) } },
     });
     const entry = payload?.time_entry || payload?.timer?.time_entry || payload?.timer || payload;
+    const timezone = (await this.configStore.read()).timezone;
     return {
-      ...presentTimeEntry(entry),
+      ...presentTimeEntry(entry, { timezone }),
       timerId: timer.id,
       elapsedSeconds: timer.elapsedSeconds,
       elapsed: formatDuration(timer.elapsedSeconds),
@@ -710,14 +715,14 @@ function validDateKey(value) {
   return date.toISOString().slice(0, 10) === value;
 }
 
-export function presentTimeEntry(entry) {
+export function presentTimeEntry(entry, { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone } = {}) {
   const startedAt = entry.started_at || null;
   const localStartedAt = entry.local_started_at || null;
   return {
     id: entry.id,
     startedAt,
     localStartedAt,
-    localDate: String(localStartedAt || startedAt || "").slice(0, 10),
+    localDate: localStartedAt ? String(localStartedAt).slice(0, 10) : dateInTimezone(startedAt, timezone),
     durationSeconds: Math.max(0, Number(entry.duration) || 0),
     projectId: entry.project_id ?? null,
     clientId: entry.client_id ?? null,
@@ -727,6 +732,17 @@ export function presentTimeEntry(entry) {
     billed: entry.billed === true,
     snapshotToken: entrySnapshot(entry),
   };
+}
+
+function dateInTimezone(timestamp, timezone) {
+  if (!timestamp) return "";
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "";
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(date).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
 function logicalTimerSnapshot(segments) {
