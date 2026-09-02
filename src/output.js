@@ -28,6 +28,7 @@ export class Output {
             code: error.code,
             message: error.message,
             ...(error.status === undefined ? {} : { status: error.status }),
+            ...(error.outcomeUnknown ? { outcomeUnknown: true } : {}),
             ...(error.details === undefined ? {} : { details: error.details }),
           },
         })}\n`,

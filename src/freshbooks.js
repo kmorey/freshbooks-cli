@@ -104,6 +104,15 @@ export class FreshBooksService {
     return clients;
   }
 
+  async clientRecords() {
+    return (await this.clients()).map((client) => ({
+      id: client.id,
+      name: clientDisplayName(client),
+      organization: String(client.organization || ""),
+      active: client.vis_state !== 1,
+    }));
+  }
+
   async projectRecords(options = {}) {
     const [projects, clients] = await Promise.all([this.projects(options), this.clients()]);
     const names = new Map(clients.map((client) => [Number(client.id), clientDisplayName(client)]));
@@ -170,23 +179,44 @@ export class FreshBooksService {
 
   async createTimeEntry(fields) {
     const businessId = await this.businessId();
-    const entry = { ...fields };
+    let entry = { ...fields };
     if (!entry.identity_id) entry.identity_id = (await this.identity()).id;
-    if (!entry.client_id && entry.project_id) {
-      entry.client_id = (await this.project(entry.project_id)).client_id;
+    if (entry.project_id) {
+      const { project, abilities } = await this.timerProject(entry.project_id);
+      const service = selectProjectService(project, entry.service_id);
+      assertTrackableProject(project, service, abilities);
+      entry = {
+        ...entry,
+        client_id: project.client_id ?? null,
+        service_id: service.id,
+        billable: service.billable === true,
+        internal: project.internal === true,
+      };
     }
     const payload = await this.client.request(`/timetracking/business/${businessId}/time_entries`, {
       method: "POST",
       body: { time_entry: compact(entry) },
     });
-    return payload?.time_entry || payload;
+    return presentTimeEntry(payload?.time_entry || payload);
   }
 
   async updateTimeEntry(entryId, patch, { snapshotToken } = {}) {
     const existing = await this.timeEntry(entryId);
     assertSnapshot(snapshotToken, entrySnapshot(existing), presentTimeEntry(existing));
-    if (patch.project_id && patch.client_id === undefined && patch.project_id !== existing.project_id) {
-      patch = { ...patch, client_id: (await this.project(patch.project_id)).client_id };
+    if (patch.project_id !== undefined || patch.service_id !== undefined) {
+      const projectId = patch.project_id ?? existing.project_id;
+      const serviceId = patch.service_id ?? existing.service_id;
+      const { project, abilities } = await this.timerProject(projectId);
+      const service = selectProjectService(project, serviceId);
+      assertTrackableProject(project, service, abilities);
+      patch = {
+        ...patch,
+        project_id: projectId,
+        client_id: project.client_id ?? null,
+        service_id: service.id,
+        billable: service.billable === true,
+        internal: project.internal === true,
+      };
     }
     const entry = compact({ ...writableTimeEntry(existing), ...patch });
     const businessId = await this.businessId();
@@ -194,15 +224,60 @@ export class FreshBooksService {
       `/timetracking/business/${businessId}/time_entries/${entryId}`,
       { method: "PUT", body: { time_entry: entry } },
     );
-    return payload?.time_entry || payload;
+    return presentTimeEntry(payload?.time_entry || payload);
   }
 
-  async deleteTimeEntry(entryId) {
+  async deleteTimeEntry(entryId, { snapshotToken } = {}) {
+    const existing = await this.timeEntry(entryId);
+    assertSnapshot(snapshotToken, entrySnapshot(existing), presentTimeEntry(existing));
     const businessId = await this.businessId();
     await this.client.request(`/timetracking/business/${businessId}/time_entries/${entryId}`, {
       method: "DELETE",
     });
     return { id: entryId, deleted: true };
+  }
+
+  async localDateFields(dateKey) {
+    if (!validDateKey(dateKey)) {
+      throw new CliError("Time entry date must use YYYY-MM-DD", {
+        code: "INVALID_ARGUMENT",
+        exitCode: 2,
+      });
+    }
+    const timezone = (await this.configStore.read()).timezone;
+    const localStartedAt = `${dateKey}T12:00:00`;
+    try {
+      return {
+        started_at: zonedLocalToUtc(localStartedAt, timezone).toISOString(),
+        local_started_at: localStartedAt,
+        local_timezone: timezone,
+      };
+    } catch {
+      throw new CliError(`Invalid FreshBooks timezone: ${timezone}`, {
+        code: "INVALID_TIMEZONE",
+        exitCode: 2,
+      });
+    }
+  }
+
+  async localRangeBoundary(value, { endOfDay = false } = {}) {
+    if (!validDateKey(value)) {
+      throw new CliError("Time entry range date must use a valid YYYY-MM-DD date", {
+        code: "INVALID_ARGUMENT",
+        exitCode: 2,
+      });
+    }
+    const timezone = (await this.configStore.read()).timezone;
+    const boundaryDate = endOfDay ? addDateKey(value, 1) : value;
+    try {
+      const boundary = zonedLocalToUtc(`${boundaryDate}T00:00:00`, timezone);
+      return endOfDay ? new Date(boundary.getTime() - 1) : boundary;
+    } catch {
+      throw new CliError(`Invalid FreshBooks timezone: ${timezone}`, {
+        code: "INVALID_TIMEZONE",
+        exitCode: 2,
+      });
+    }
   }
 
   async activeTimers() {
@@ -233,12 +308,13 @@ export class FreshBooksService {
 
   async timerCandidates() {
     const businessId = await this.businessId();
+    const identityId = (await this.identity()).id;
     // include_unlogged adds running/paused entries to the ordinary time-entry
     // result set. Timer polling must stay bounded instead of traversing the
     // account's complete history on every status check.
     const payload = await this.client.request(
       `/timetracking/business/${businessId}/time_entries`,
-      { query: { include_unlogged: true, per_page: 100, page: 1 } },
+      { query: { include_unlogged: true, identity_id: identityId, per_page: 100, page: 1 } },
     );
     return payload?.time_entries || [];
   }
@@ -394,7 +470,12 @@ export class FreshBooksService {
       body: { timer: { time_entries: timer._segments.map((segment) => timerEntryFields(segment)) } },
     });
     const entry = payload?.time_entry || payload?.timer?.time_entry || payload?.timer || payload;
-    return { ...entry, timerId: timer.id, elapsedSeconds: timer.elapsedSeconds, elapsed: formatDuration(timer.elapsedSeconds) };
+    return {
+      ...presentTimeEntry(entry),
+      timerId: timer.id,
+      elapsedSeconds: timer.elapsedSeconds,
+      elapsed: formatDuration(timer.elapsedSeconds),
+    };
   }
 
   async switchTimer(timerId, fields, { snapshotToken } = {}) {
@@ -447,6 +528,8 @@ export function writableTimeEntry(entry) {
     "identity_id",
     "is_logged",
     "started_at",
+    "local_started_at",
+    "local_timezone",
     "client_id",
     "project_id",
     "pending_client",
@@ -576,6 +659,45 @@ function clientDisplayName(client) {
   const organization = String(client?.organization || "").trim();
   if (organization) return organization;
   return [client?.fname, client?.lname].filter(Boolean).join(" ").trim();
+}
+
+function zonedLocalToUtc(localTimestamp, timezone) {
+  const [datePart, timePart] = localTimestamp.split("T");
+  const [year, month, day] = datePart.split("-").map(Number);
+  const [hour, minute, second] = timePart.split(":").map(Number);
+  const desired = Date.UTC(year, month - 1, day, hour, minute, second);
+  let candidate = desired;
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hourCycle: "h23",
+  });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const parts = Object.fromEntries(
+      formatter.formatToParts(new Date(candidate)).map((part) => [part.type, part.value]),
+    );
+    const observed = Date.UTC(
+      Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+      Number(parts.hour), Number(parts.minute), Number(parts.second),
+    );
+    const adjustment = desired - observed;
+    candidate += adjustment;
+    if (adjustment === 0) return new Date(candidate);
+  }
+  return new Date(candidate);
+}
+
+function addDateKey(dateKey, days) {
+  const [year, month, day] = dateKey.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10);
+}
+
+function validDateKey(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
+  if (!match) return false;
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  return date.toISOString().slice(0, 10) === value;
 }
 
 export function presentTimeEntry(entry) {

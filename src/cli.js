@@ -53,6 +53,9 @@ export async function run(argv, dependencies = {}) {
     if (group === "projects") {
       return await projectsCommand({ action, options: parsed.options, output, service });
     }
+    if (group === "clients") {
+      return await clientsCommand({ action, output, service });
+    }
     if (group === "timer") {
       return await timerCommand({ action, argument, options: parsed.options, output, service });
     }
@@ -201,6 +204,16 @@ async function projectsCommand({ action, options, output, service }) {
   return 0;
 }
 
+async function clientsCommand({ action, output, service }) {
+  if (action !== "list") throw unknownAction("clients", action);
+  const clients = await service.clientRecords();
+  output.success(
+    clients,
+    clients.map((client) => `${client.id}\t${client.name}`).join("\n") || "No clients found.",
+  );
+  return 0;
+}
+
 async function timerCommand({ action, argument, options, output, service }) {
   const timerId = optionalInteger(argument ?? options.id, "id");
   if (action === "status") {
@@ -290,8 +303,16 @@ async function timerCommand({ action, argument, options, output, service }) {
 async function timeCommand({ action, argument, options, output, service }) {
   const entryId = optionalInteger(argument, "entry-id");
   if (action === "list") {
-    const from = parseRangeDate(options.from, "from");
-    const to = parseRangeDate(options.to, "to", { endOfDay: true });
+    const from = options.from === undefined
+      ? undefined
+      : (/^\d{4}-\d{2}-\d{2}$/.test(options.from)
+          ? await service.localRangeBoundary(options.from)
+          : parseRangeDate(options.from, "from"));
+    const to = options.to === undefined
+      ? undefined
+      : (/^\d{4}-\d{2}-\d{2}$/.test(options.to)
+          ? await service.localRangeBoundary(options.to, { endOfDay: true })
+          : parseRangeDate(options.to, "to", { endOfDay: true }));
     const entries = await service.timeEntryRecords({
       started_from: from?.toISOString(),
       started_to: to?.toISOString(),
@@ -308,11 +329,14 @@ async function timeCommand({ action, argument, options, output, service }) {
   }
   if (action === "add") {
     const duration = parseDuration(requireOption(options, "duration"));
-    const startedAt = parseDate(options.startedAt || new Date().toISOString(), "started-at");
+    const localDateFields = options.date ? await service.localDateFields(options.date) : {};
+    const startedAt = parseDate(options.startedAt || localDateFields.started_at || new Date().toISOString(), "started-at");
     const entry = await service.createTimeEntry({
       is_logged: true,
       duration,
       started_at: startedAt.toISOString(),
+      local_started_at: localDateFields.local_started_at,
+      local_timezone: localDateFields.local_timezone,
       project_id: optionalInteger(options.project, "project"),
       client_id: optionalInteger(options.client, "client"),
       service_id: optionalInteger(options.service, "service"),
@@ -324,9 +348,12 @@ async function timeCommand({ action, argument, options, output, service }) {
   }
   if (action === "update") {
     if (!entryId) throw new CliError("Usage: freshbooks time update <id> [options]", { exitCode: 2 });
+    const localDateFields = options.date ? await service.localDateFields(options.date) : {};
     const patch = {
       duration: options.duration === undefined ? undefined : parseDuration(options.duration),
-      started_at: parseDate(options.startedAt, "started-at")?.toISOString(),
+      started_at: parseDate(options.startedAt || localDateFields.started_at, "started-at")?.toISOString(),
+      local_started_at: localDateFields.local_started_at,
+      local_timezone: localDateFields.local_timezone,
       project_id: optionalInteger(options.project, "project"),
       client_id: optionalInteger(options.client, "client"),
       service_id: optionalInteger(options.service, "service"),
@@ -348,7 +375,7 @@ async function timeCommand({ action, argument, options, output, service }) {
         exitCode: 2,
       });
     }
-    const result = await service.deleteTimeEntry(entryId);
+    const result = await service.deleteTimeEntry(entryId, { snapshotToken: options.snapshot });
     output.success(result, `Deleted FreshBooks time entry #${entryId}.`);
     return 0;
   }
@@ -397,6 +424,7 @@ Usage:
   freshbooks business list
   freshbooks business use ID
   freshbooks projects list [--all]
+  freshbooks clients list
   freshbooks timer status
   freshbooks timer start --project ID --service ID [--note TEXT]
   freshbooks timer pause [--id TIMER_ID]
@@ -407,9 +435,9 @@ Usage:
   freshbooks timer switch --project ID --service ID [--id TIMER_ID]
   freshbooks timer discard [--id TIMER_ID] --yes
   freshbooks time list [--from DATE] [--to DATE] [--project ID]
-  freshbooks time add --duration 1h30m [--started-at DATE] [--project ID] [--note TEXT]
-  freshbooks time update ENTRY_ID [--duration 45m] [--note TEXT]
-  freshbooks time delete ENTRY_ID --yes
+  freshbooks time add --duration 1h30m [--date YYYY-MM-DD] [--project ID] [--note TEXT]
+  freshbooks time update ENTRY_ID [--date YYYY-MM-DD] [--duration 45m] [--note TEXT]
+  freshbooks time delete ENTRY_ID --snapshot TOKEN --yes
 
 Options:
   --json       Emit one stable JSON object for Quickshell and scripts
@@ -418,5 +446,6 @@ Options:
 
 Environment overrides:
   FRESHBOOKS_CLIENT_ID, FRESHBOOKS_CLIENT_SECRET, FRESHBOOKS_REDIRECT_URI
+  FRESHBOOKS_TIMEZONE (IANA name, for example America/Chicago)
   FRESHBOOKS_ACCESS_TOKEN, FRESHBOOKS_REFRESH_TOKEN, FRESHBOOKS_TOKEN_EXPIRES_AT
   FRESHBOOKS_BUSINESS_ID, FRESHBOOKS_PROFILE`;

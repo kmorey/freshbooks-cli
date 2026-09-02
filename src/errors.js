@@ -1,11 +1,12 @@
 export class CliError extends Error {
-  constructor(message, { code = "CLI_ERROR", exitCode = 1, details, status } = {}) {
+  constructor(message, { code = "CLI_ERROR", exitCode = 1, details, status, outcomeUnknown = false } = {}) {
     super(message);
     this.name = "CliError";
     this.code = code;
     this.exitCode = exitCode;
     this.details = details;
     this.status = status;
+    this.outcomeUnknown = outcomeUnknown;
   }
 }
 

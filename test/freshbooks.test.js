@@ -49,6 +49,66 @@ test("normalizes project/client joins and logged time entries for plugins", asyn
     durationSeconds: 90, projectId: 44, clientId: null, serviceId: null, note: "Work", billable: false, billed: false, snapshotToken: undefined,
   });
   assert.match(normalized.snapshotToken, /^[a-f0-9]{64}$/);
+  assert.deepEqual(await service.clientRecords(), [{
+    id: 55, name: "Example Client", organization: "Example Client", active: true,
+  }]);
+});
+
+test("converts FreshBooks-local calendar dates at DST-aware boundaries", async () => {
+  const timezoneConfig = {
+    async read() { return { businessId, timezone: "America/Chicago" }; },
+    async update() {},
+  };
+  const service = new FreshBooksService({ client: {}, configStore: timezoneConfig });
+  assert.deepEqual(await service.localDateFields("2026-03-08"), {
+    started_at: "2026-03-08T17:00:00.000Z",
+    local_started_at: "2026-03-08T12:00:00",
+    local_timezone: "America/Chicago",
+  });
+  assert.equal((await service.localRangeBoundary("2026-03-08")).toISOString(), "2026-03-08T06:00:00.000Z");
+  assert.equal(
+    (await service.localRangeBoundary("2026-03-08", { endOfDay: true })).toISOString(),
+    "2026-03-09T04:59:59.999Z",
+  );
+  await assert.rejects(service.localDateFields("2026-02-30"), { code: "INVALID_ARGUMENT" });
+});
+
+test("deleteTimeEntry rejects a stale snapshot before DELETE", async () => {
+  let deletes = 0;
+  const client = { async request(path, options = {}) {
+    if (path.endsWith("/time_entries/9") && !options.method) return { time_entry: { id: 9, is_logged: true, duration: 60, started_at: "2026-09-02T12:00:00Z" } };
+    if (options.method === "DELETE") deletes += 1;
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore });
+  await assert.rejects(service.deleteTimeEntry(9, { snapshotToken: "stale" }), { code: "REMOTE_CHANGED" });
+  assert.equal(deletes, 0);
+});
+
+test("logged entries derive client and billability from the selected project service", async () => {
+  let written;
+  const client = { async request(path, options = {}) {
+    if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
+    if (path === "/comments/business/123/project/44") return {
+      project: { id: 44, client_id: 55, internal: false, active: true, complete: false, services: [{ id: 66, billable: true }] },
+      abilities: [{ name: "can_track_time", value: true }],
+    };
+    if (path === "/timetracking/business/123/time_entries" && options.method === "POST") {
+      written = options.body.time_entry;
+      return { time_entry: { id: 9, ...written } };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore });
+  const result = await service.createTimeEntry({
+    is_logged: true, duration: 60, started_at: "2026-09-02T12:00:00Z", project_id: 44, service_id: 66,
+  });
+  assert.equal(written.client_id, 55);
+  assert.equal(written.billable, true);
+  assert.equal(result.projectId, 44);
+  assert.equal(result.clientId, 55);
+  assert.equal(result.billable, true);
+  assert.match(result.snapshotToken, /^[a-f0-9]{64}$/);
 });
 
 test("startTimer creates a timer identity then assigns project metadata", async () => {
@@ -86,6 +146,7 @@ test("pause closes the open segment and resume appends a segment", async () => {
   let entries = [segment()];
   const client = { async request(path, options = {}) {
     requests.push({ path, ...options });
+    if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
     if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
     if (path === "/comments/business/123/time_entries/900" && options.method === "PUT") {
       entries = [{ ...entries[0], ...options.body.time_entry, timer: { id: 901, is_running: false } }];
@@ -115,6 +176,7 @@ test("pause closes the open segment and resume appends a segment", async () => {
 test("timer mutations reject stale snapshots before writing", async () => {
   let writes = 0;
   const client = { async request(path, options = {}) {
+    if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
     if (path === "/timetracking/business/123/time_entries") return { time_entries: [segment()] };
     if (options.method) writes += 1;
     throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
@@ -129,6 +191,7 @@ test("running correction preserves closed duration and rebases the open segment"
   let entries = [segment({ id: 900, duration: 57, started_at: "2026-09-01T14:00:00Z" }), segment({ id: 902 })];
   const client = { async request(path, options = {}) {
     requests.push({ path, ...options });
+    if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
     if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
     if (options.method === "PUT") {
       const id = Number(path.split("/").at(-1));
@@ -150,6 +213,7 @@ test("logTimer preflights the project and PUTs the logical timer resource", asyn
   const entries = [segment({ duration: 60, timer: { id: 901, is_running: false } })];
   const client = { async request(path, options = {}) {
     requests.push({ path, ...options });
+    if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
     if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
     if (path === "/comments/business/123/project/44") return { project: { id: 44, active: true, complete: false, services: [{ id: 66, billable: true }] }, abilities: [{ name: "can_track_time", value: true }] };
     if (path === "/comments/business/123/timers/901" && options.method === "PUT") return { time_entry: { id: 903, is_logged: true, duration: 60 } };
@@ -164,13 +228,17 @@ test("logTimer preflights the project and PUTs the logical timer resource", asyn
   assert.equal(logged.elapsedSeconds, 60);
 });
 
-test("activeTimers makes one bounded request instead of paginating history", async () => {
+test("activeTimers makes one identity-scoped bounded request instead of paginating history", async () => {
   let requests = 0;
-  const client = { async request(path) {
-    if (path.includes("/time_entries")) { requests += 1; return { time_entries: [], meta: { page: 1, pages: 500 } }; }
+  let query;
+  const client = { async request(path, options = {}) {
+    if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
+    if (path.includes("/time_entries")) { requests += 1; query = options.query; return { time_entries: [], meta: { page: 1, pages: 500 } }; }
     throw new Error(`Unexpected request: ${path}`);
   } };
   const service = new FreshBooksService({ client, configStore });
   assert.deepEqual(await service.activeTimers(), []);
   assert.equal(requests, 1);
+  assert.equal(query.identity_id, 88);
+  assert.equal(query.per_page, 100);
 });

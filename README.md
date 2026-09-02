@@ -77,6 +77,7 @@ If Secret Service cannot be reached—for example, from a terminal without an in
 
 ```bash
 freshbooks projects list
+freshbooks clients list
 freshbooks timer start --project 12345 --service 67890 --note 'Implement time widget'
 freshbooks timer status
 freshbooks timer pause
@@ -103,10 +104,12 @@ freshbooks timer discard --id 456 --yes
 
 ```bash
 freshbooks time list --from 2026-09-01 --to 2026-09-02
-freshbooks time add --duration 1h30m --project 12345 --note 'Planning'
-freshbooks time update 98765 --duration 1h45m --note 'Planning and review'
-freshbooks time delete 98765 --yes
+freshbooks time add --date 2026-09-02 --duration 1h30m --project 12345 --service 67890 --note 'Planning'
+freshbooks time update 98765 --date 2026-09-03 --duration 1h45m --note 'Planning and review'
+freshbooks time delete 98765 --snapshot SNAPSHOT_TOKEN --yes
 ```
+
+Calendar dates use the configured FreshBooks timezone, including daylight-saving transitions. Set `FRESHBOOKS_TIMEZONE` to the account's IANA timezone (for example, `America/Chicago`) when it differs from the machine timezone. Entry create and project/service changes derive client, internal, and billability fields from the selected FreshBooks project service.
 
 ## Quickshell contract
 
@@ -153,6 +156,7 @@ Recommended plugin behavior:
 
 - Poll `freshbooks timer status --json` every 15–30 seconds and immediately after actions.
 - Advance a running duration locally between polls instead of calling the API every second.
+- Treat `API_TIMEOUT` with `outcomeUnknown: true` as ambiguous and refresh before allowing another mutation.
 - Run authentication interactively outside the long-lived Quickshell process.
 - Do not read or copy the keyring contents into QML.
 
