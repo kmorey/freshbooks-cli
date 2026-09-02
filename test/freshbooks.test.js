@@ -281,3 +281,18 @@ test("recent time-entry history stops at the requested bound", async () => {
   assert.equal(entries.length, 200);
   assert.deepEqual(pages, [1, 2]);
 });
+
+test("timer switch validates the target before logging current work", async () => {
+  let timerWrites = 0;
+  const client = { async request(path, options = {}) {
+    if (path === "/comments/business/123/project/99") return {
+      project: { id: 99, active: false, complete: false, services: [{ id: 77, billable: true }] },
+      abilities: [{ name: "can_track_time", value: true }],
+    };
+    if (path.includes("/timers/") && options.method === "PUT") timerWrites += 1;
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore, now });
+  await assert.rejects(service.switchTimer(901, { project_id: 99, service_id: 77 }), { code: "PROJECT_NOT_ACTIVE" });
+  assert.equal(timerWrites, 0);
+});
