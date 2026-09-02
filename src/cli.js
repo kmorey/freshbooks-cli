@@ -202,7 +202,7 @@ async function projectsCommand({ action, options, output, service }) {
 }
 
 async function timerCommand({ action, argument, options, output, service }) {
-  const entryId = optionalInteger(argument, "entry-id");
+  const timerId = optionalInteger(argument ?? options.id, "id");
   if (action === "status") {
     const timers = await service.activeTimers();
     output.success(
@@ -235,8 +235,42 @@ async function timerCommand({ action, argument, options, output, service }) {
     return 0;
   }
   if (action === "log") {
-    const entry = await service.logTimer(entryId);
+    const entry = await service.logTimer(timerId);
     output.success(entry, `Logged ${entry.elapsed} to FreshBooks (#${entry.id}).`);
+    return 0;
+  }
+  if (action === "pause") {
+    const timer = await service.pauseTimer(timerId);
+    output.success(timer, `Paused FreshBooks timer #${timer.id}.`);
+    return 0;
+  }
+  if (action === "resume") {
+    const timer = await service.resumeTimer(timerId);
+    output.success(timer, `Resumed FreshBooks timer #${timer.id}.`);
+    return 0;
+  }
+  if (action === "correct") {
+    const duration = parseDuration(requireOption(options, "duration"));
+    const timer = await service.correctTimer(timerId, duration);
+    output.success(timer, `Corrected FreshBooks timer #${timer.id} to ${timer.elapsed}.`);
+    return 0;
+  }
+  if (action === "update") {
+    if (options.note === undefined) {
+      throw new CliError("Provide --note to update a timer", { exitCode: 2 });
+    }
+    const timer = await service.updateTimer(timerId, { note: options.note });
+    output.success(timer, `Updated FreshBooks timer #${timer.id}.`);
+    return 0;
+  }
+  if (action === "switch") {
+    const result = await service.switchTimer(timerId, {
+      project_id: optionalInteger(options.project, "project"),
+      client_id: optionalInteger(options.client, "client"),
+      service_id: optionalInteger(options.service, "service"),
+      note: options.note,
+    });
+    output.success(result, `Switched to FreshBooks timer #${result.timer.id}.`);
     return 0;
   }
   if (action === "discard") {
@@ -246,15 +280,9 @@ async function timerCommand({ action, argument, options, output, service }) {
         exitCode: 2,
       });
     }
-    const result = await service.discardTimer(entryId);
+    const result = await service.discardTimer(timerId);
     output.success(result, `Discarded FreshBooks timer #${result.id}.`);
     return 0;
-  }
-  if (action === "pause" || action === "resume") {
-    throw new CliError(
-      `FreshBooks does not document public ${action} semantics. Start/status/log are supported; ${action} awaits live-account validation.`,
-      { code: "UNVERIFIED_TIMER_OPERATION", exitCode: 2 },
-    );
   }
   throw unknownAction("timer", action);
 }
@@ -370,9 +398,14 @@ Usage:
   freshbooks business use ID
   freshbooks projects list [--all]
   freshbooks timer status
-  freshbooks timer start [--project ID] [--client ID] [--service ID] [--note TEXT] [--billable]
-  freshbooks timer log [ENTRY_ID]
-  freshbooks timer discard [ENTRY_ID] --yes
+  freshbooks timer start --project ID --service ID [--note TEXT]
+  freshbooks timer pause [--id TIMER_ID]
+  freshbooks timer resume [--id TIMER_ID]
+  freshbooks timer correct --duration SECONDS [--id TIMER_ID]
+  freshbooks timer update --note TEXT [--id TIMER_ID]
+  freshbooks timer log [--id TIMER_ID]
+  freshbooks timer switch --project ID --service ID [--id TIMER_ID]
+  freshbooks timer discard [--id TIMER_ID] --yes
   freshbooks time list [--from DATE] [--to DATE] [--project ID]
   freshbooks time add --duration 1h30m [--started-at DATE] [--project ID] [--note TEXT]
   freshbooks time update ENTRY_ID [--duration 45m] [--note TEXT]

@@ -32,7 +32,7 @@ rm "$installer"
 Running the installer again upgrades to the latest GitHub release. Pin a release or choose another user-writable prefix when needed:
 
 ```bash
-sh install.sh --version v0.1.0
+sh install.sh --version v0.2.0
 sh install.sh --prefix "$HOME/.local"
 ```
 
@@ -49,7 +49,7 @@ The installer refuses to replace a `freshbooks` command it does not manage.
 Any platform with Node.js 22+, npm, and Git can install from GitHub:
 
 ```bash
-npm install --global github:kmorey/freshbooks-cli#v0.1.0
+npm install --global github:kmorey/freshbooks-cli#v0.2.0
 freshbooks --help
 ```
 

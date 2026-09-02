@@ -83,6 +83,17 @@ export class FreshBooksService {
     return payload?.project || payload?.response?.result?.project || payload;
   }
 
+  async timerProject(projectId) {
+    const businessId = await this.businessId();
+    const payload = await this.client.request(
+      `/comments/business/${businessId}/project/${projectId}`,
+    );
+    return {
+      project: payload?.project || payload?.response?.result?.project || payload,
+      abilities: payload?.abilities || payload?.response?.result?.abilities || [],
+    };
+  }
+
   async listTimeEntries(filters = {}) {
     const businessId = await this.businessId();
     const entries = [];
@@ -145,28 +156,25 @@ export class FreshBooksService {
 
   async activeTimers() {
     const entries = await this.timerCandidates();
-    return entries
-      .filter((entry) => entry.is_logged === false || entry.timer?.is_running === true)
-      .map((entry) => presentTimer(entry, this.now()));
+    return groupTimerSegments(entries, this.now());
   }
 
-  async activeTimer(entryId) {
-    if (entryId !== undefined) {
-      const entry = await this.timeEntry(entryId);
-      if (entry.is_logged !== false && entry.timer?.is_running !== true) {
-        throw new CliError(`Time entry ${entryId} is not an active timer`, { code: "TIMER_NOT_ACTIVE" });
+  async activeTimer(timerId) {
+    const active = await this.activeTimers();
+    if (timerId !== undefined) {
+      const timer = active.find(
+        (candidate) => candidate.id === timerId || candidate.segmentIds.includes(timerId),
+      );
+      if (!timer) {
+        throw new CliError(`Timer ${timerId} is not active`, { code: "TIMER_NOT_ACTIVE" });
       }
-      return entry;
+      return timer;
     }
-    const entries = await this.timerCandidates();
-    const active = entries.filter(
-      (entry) => entry.is_logged === false || entry.timer?.is_running === true,
-    );
     if (active.length === 0) throw new CliError("No FreshBooks timer is active", { code: "NO_ACTIVE_TIMER" });
     if (active.length > 1) {
-      throw new CliError("More than one FreshBooks timer is active; specify an entry ID", {
+      throw new CliError("More than one FreshBooks timer is active; specify a timer ID", {
         code: "MULTIPLE_ACTIVE_TIMERS",
-        details: active.map((entry) => entry.id),
+        details: active.map((timer) => timer.id),
       });
     }
     return active[0];
@@ -195,30 +203,186 @@ export class FreshBooksService {
       }
     }
 
+    if (!fields.project_id) {
+      throw new CliError("Starting a timer requires a project", {
+        code: "PROJECT_REQUIRED",
+        exitCode: 2,
+      });
+    }
+    const businessId = await this.businessId();
+    const identity = await this.identity();
+    const { project, abilities } = await this.timerProject(fields.project_id);
+    const service = selectProjectService(project, fields.service_id);
+    assertTrackableProject(project, service, abilities);
     const startedAt = fields.started_at || this.now().toISOString();
-    const entry = await this.createTimeEntry({
+    const common = timerEntryFields({
       ...fields,
+      client_id: project.client_id ?? null,
+      service_id: service?.id ?? fields.service_id ?? null,
+      billable: service?.billable ?? fields.billable ?? false,
+      internal: project.internal === true,
       is_logged: false,
       started_at: startedAt,
-      duration: 0,
+      local_started_at: fields.local_started_at ?? null,
+      local_timezone: fields.local_timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
+      duration: null,
     });
-    return presentTimer(entry, this.now());
+    const createdPayload = await this.client.request(
+      `/comments/business/${businessId}/time_entries`,
+      { method: "POST", body: { time_entry: { ...common, note: null, internal: false, timer: {}, identity_id: null, client_id: null, project_id: null, service_id: null } } },
+    );
+    const created = createdPayload?.time_entry || createdPayload;
+    if (!created?.id || !created?.timer?.id) {
+      throw new CliError("FreshBooks did not create a timer identity", {
+        code: "INVALID_API_RESPONSE",
+        details: createdPayload,
+      });
+    }
+    const assigned = {
+      ...common,
+      identity_id: identity.id,
+      timer: { id: created.timer.id },
+    };
+    await this.client.request(
+      `/comments/business/${businessId}/time_entries/${created.id}`,
+      { method: "PUT", body: { time_entry: assigned } },
+    );
+    return this.requireRefreshedTimer(created.timer.id);
   }
 
-  async logTimer(entryId) {
-    const active = await this.activeTimer(entryId);
-    const duration = elapsedSeconds(active, this.now());
-    const entry = await this.updateTimeEntry(active.id, {
-      is_logged: true,
-      duration,
-      ...(active.timer?.id ? { timer: { id: active.timer.id } } : {}),
-    });
-    return { ...entry, elapsed_seconds: duration, elapsed: formatDuration(duration) };
+  async pauseTimer(timerId) {
+    const timer = await this.activeTimer(timerId);
+    if (!timer.running || !timer._openSegment) return timer;
+    const duration = Math.max(
+      0,
+      Math.floor((this.now().getTime() - new Date(timer._openSegment.started_at).getTime()) / 1000),
+    );
+    await this.updateTimerSegment(timer._openSegment, { duration });
+    return this.requireRefreshedTimer(timer.id);
   }
 
-  async discardTimer(entryId) {
-    const active = await this.activeTimer(entryId);
-    return this.deleteTimeEntry(active.id);
+  async resumeTimer(timerId) {
+    const timer = await this.activeTimer(timerId);
+    if (timer.running) return timer;
+    const template = timer._segments.at(-1);
+    const businessId = await this.businessId();
+    await this.client.request(`/comments/business/${businessId}/time_entries`, {
+      method: "POST",
+      body: {
+        time_entry: timerEntryFields({
+          ...template,
+          id: undefined,
+          duration: null,
+          started_at: this.now().toISOString(),
+          local_started_at: null,
+          identity_id: null,
+          timer: { id: timer.id },
+        }),
+      },
+    });
+    return this.requireRefreshedTimer(timer.id);
+  }
+
+  async correctTimer(timerId, targetSeconds) {
+    const timer = await this.activeTimer(timerId);
+    if (!Number.isSafeInteger(targetSeconds) || targetSeconds < 0) {
+      throw new CliError("Timer duration must be whole non-negative seconds", {
+        code: "INVALID_DURATION",
+        exitCode: 2,
+      });
+    }
+    const closed = timer._segments.filter((segment) => segment.duration != null);
+    const closedSeconds = closed.reduce((total, segment) => total + Number(segment.duration || 0), 0);
+    if (timer.running) {
+      if (targetSeconds < closedSeconds) {
+        throw new CliError("Duration cannot be shorter than completed timer segments", {
+          code: "DURATION_BELOW_CLOSED_SEGMENTS",
+          details: { minimumSeconds: closedSeconds },
+        });
+      }
+      const startedAt = new Date(this.now().getTime() - (targetSeconds - closedSeconds) * 1000).toISOString();
+      for (const segment of timer._segments) {
+        await this.updateTimerSegment(segment, segment.id === timer._openSegment.id
+          ? { started_at: startedAt, local_started_at: startedAt }
+          : {});
+      }
+    } else {
+      const last = closed.at(-1);
+      const priorSeconds = closed.slice(0, -1).reduce((total, segment) => total + Number(segment.duration || 0), 0);
+      if (!last || targetSeconds < priorSeconds) {
+        throw new CliError("Duration cannot be shorter than earlier timer segments", {
+          code: "DURATION_BELOW_CLOSED_SEGMENTS",
+          details: { minimumSeconds: priorSeconds },
+        });
+      }
+      await this.updateTimerSegment(last, { duration: targetSeconds - priorSeconds });
+    }
+    return this.requireRefreshedTimer(timer.id);
+  }
+
+  async updateTimer(timerId, patch) {
+    const timer = await this.activeTimer(timerId);
+    for (const segment of timer._segments) await this.updateTimerSegment(segment, patch);
+    return this.requireRefreshedTimer(timer.id);
+  }
+
+  async logTimer(timerId) {
+    let timer = await this.activeTimer(timerId);
+    if (timer.running) timer = await this.pauseTimer(timer.id);
+    const { project, abilities } = await this.timerProject(timer.projectId);
+    const selectedService = selectProjectService(project, timer.serviceId);
+    assertTrackableProject(project, selectedService, abilities);
+    const businessId = await this.businessId();
+    const payload = await this.client.request(`/comments/business/${businessId}/timers/${timer.id}`, {
+      method: "PUT",
+      body: { timer: { time_entries: timer._segments.map((segment) => timerEntryFields(segment)) } },
+    });
+    const entry = payload?.time_entry || payload?.timer?.time_entry || payload?.timer || payload;
+    return { ...entry, timerId: timer.id, elapsedSeconds: timer.elapsedSeconds, elapsed: formatDuration(timer.elapsedSeconds) };
+  }
+
+  async switchTimer(timerId, fields) {
+    let logged = null;
+    const timers = await this.activeTimers();
+    if (timers.length > 0) logged = await this.logTimer(timerId);
+    try {
+      const timer = await this.startTimer(fields);
+      return { logged, timer, partial: false };
+    } catch (error) {
+      if (logged) {
+        throw new CliError("The previous timer logged, but the next timer did not start", {
+          code: "TIMER_SWITCH_PARTIAL",
+          details: { logged, startError: { code: error.code, message: error.message } },
+        });
+      }
+      throw error;
+    }
+  }
+
+  async discardTimer(timerId) {
+    const timer = await this.activeTimer(timerId);
+    for (const segment of timer._segments) await this.deleteTimeEntry(segment.id);
+    return { id: timer.id, segmentIds: timer.segmentIds, deleted: true };
+  }
+
+  async updateTimerSegment(segment, patch) {
+    const businessId = await this.businessId();
+    const entry = timerEntryFields({ ...segment, ...patch, timer: { id: segment.timer?.id } });
+    const payload = await this.client.request(
+      `/comments/business/${businessId}/time_entries/${segment.id}`,
+      { method: "PUT", body: { time_entry: entry } },
+    );
+    return payload?.time_entry || payload;
+  }
+
+  async requireRefreshedTimer(timerId) {
+    const timer = (await this.activeTimers()).find((candidate) => candidate.id === timerId);
+    if (!timer) {
+      throw new CliError("FreshBooks did not return the expected active timer", {
+        code: "TIMER_RECONCILIATION_FAILED",
+      });
+    }
+    return timer;
   }
 }
 
@@ -245,6 +409,16 @@ export function writableTimeEntry(entry) {
   return Object.fromEntries(fields.filter((field) => entry[field] !== undefined).map((field) => [field, entry[field]]));
 }
 
+export function timerEntryFields(entry) {
+  const fields = [
+    "is_logged", "duration", "note", "internal", "retainer_id", "pending_client",
+    "pending_project", "pending_task", "source", "started_at", "local_started_at",
+    "local_timezone", "billable", "billed", "timer", "identity_id", "client_id",
+    "project_id", "service_id",
+  ];
+  return Object.fromEntries(fields.filter((field) => entry[field] !== undefined).map((field) => [field, entry[field]]));
+}
+
 function compact(object) {
   return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
 }
@@ -265,4 +439,78 @@ export function presentTimer(entry, now = new Date()) {
     note: entry.note,
     billable: entry.billable,
   };
+}
+
+export function groupTimerSegments(entries, now = new Date()) {
+  const grouped = new Map();
+  for (const entry of entries || []) {
+    if (entry?.is_logged !== false || entry?.timer?.id == null) continue;
+    const key = Number(entry.timer.id);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(entry);
+  }
+  return [...grouped.entries()].map(([timerId, segments]) => {
+    segments.sort((left, right) => new Date(left.started_at) - new Date(right.started_at));
+    const openSegments = segments.filter((segment) => segment.duration == null);
+    const current = openSegments.at(-1) || segments.at(-1);
+    const elapsed = segments.reduce(
+      (total, segment) => total + (segment.duration == null ? elapsedSeconds(segment, now) : Math.max(0, Number(segment.duration) || 0)),
+      0,
+    );
+    const timer = {
+      id: timerId,
+      timerId,
+      segmentIds: segments.map((segment) => segment.id),
+      segments: segments.map(presentTimerSegment),
+      openSegment: openSegments.length ? presentTimerSegment(openSegments.at(-1)) : null,
+      running: openSegments.length > 0,
+      isLogged: false,
+      startedAt: segments[0]?.started_at,
+      elapsedSeconds: elapsed,
+      elapsed: formatDuration(elapsed),
+      projectId: current?.project_id,
+      clientId: current?.client_id,
+      serviceId: current?.service_id,
+      note: current?.note,
+      billable: current?.billable,
+    };
+    Object.defineProperties(timer, {
+      _segments: { value: segments },
+      _openSegment: { value: openSegments.at(-1) || null },
+    });
+    return timer;
+  });
+}
+
+function presentTimerSegment(segment) {
+  return {
+    id: segment.id,
+    startedAt: segment.started_at,
+    localStartedAt: segment.local_started_at ?? null,
+    durationSeconds: segment.duration == null ? null : Math.max(0, Number(segment.duration) || 0),
+    running: segment.duration == null,
+  };
+}
+
+function selectProjectService(project, serviceId) {
+  const services = project?.services || [];
+  if (serviceId != null) return services.find((service) => Number(service.id) === Number(serviceId));
+  return services.length === 1 ? services[0] : undefined;
+}
+
+function assertTrackableProject(project, service, abilities = []) {
+  if (!project || project.active === false || project.complete === true) {
+    throw new CliError("The selected project is not active", { code: "PROJECT_NOT_ACTIVE" });
+  }
+  if (!service) {
+    throw new CliError("The selected service is not available on the project", {
+      code: "SERVICE_NOT_AVAILABLE",
+    });
+  }
+  const canTrackTime = abilities.find((ability) => ability?.name === "can_track_time");
+  if (canTrackTime?.value === false) {
+    throw new CliError("The authenticated user cannot track time on this project", {
+      code: "TIME_TRACKING_NOT_ALLOWED",
+    });
+  }
 }
