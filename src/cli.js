@@ -235,23 +235,23 @@ async function timerCommand({ action, argument, options, output, service }) {
     return 0;
   }
   if (action === "log") {
-    const entry = await service.logTimer(timerId);
+    const entry = await service.logTimer(timerId, { snapshotToken: options.snapshot });
     output.success(entry, `Logged ${entry.elapsed} to FreshBooks (#${entry.id}).`);
     return 0;
   }
   if (action === "pause") {
-    const timer = await service.pauseTimer(timerId);
+    const timer = await service.pauseTimer(timerId, { snapshotToken: options.snapshot });
     output.success(timer, `Paused FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "resume") {
-    const timer = await service.resumeTimer(timerId);
+    const timer = await service.resumeTimer(timerId, { snapshotToken: options.snapshot });
     output.success(timer, `Resumed FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "correct") {
     const duration = parseDuration(requireOption(options, "duration"));
-    const timer = await service.correctTimer(timerId, duration);
+    const timer = await service.correctTimer(timerId, duration, { snapshotToken: options.snapshot });
     output.success(timer, `Corrected FreshBooks timer #${timer.id} to ${timer.elapsed}.`);
     return 0;
   }
@@ -259,7 +259,7 @@ async function timerCommand({ action, argument, options, output, service }) {
     if (options.note === undefined) {
       throw new CliError("Provide --note to update a timer", { exitCode: 2 });
     }
-    const timer = await service.updateTimer(timerId, { note: options.note });
+    const timer = await service.updateTimer(timerId, { note: options.note }, { snapshotToken: options.snapshot });
     output.success(timer, `Updated FreshBooks timer #${timer.id}.`);
     return 0;
   }
@@ -269,7 +269,7 @@ async function timerCommand({ action, argument, options, output, service }) {
       client_id: optionalInteger(options.client, "client"),
       service_id: optionalInteger(options.service, "service"),
       note: options.note,
-    });
+    }, { snapshotToken: options.snapshot });
     output.success(result, `Switched to FreshBooks timer #${result.timer.id}.`);
     return 0;
   }
@@ -336,7 +336,7 @@ async function timeCommand({ action, argument, options, output, service }) {
     if (Object.values(patch).every((value) => value === undefined)) {
       throw new CliError("Provide at least one field to update", { exitCode: 2 });
     }
-    const entry = await service.updateTimeEntry(entryId, patch);
+    const entry = await service.updateTimeEntry(entryId, patch, { snapshotToken: options.snapshot });
     output.success(entry, `Updated FreshBooks time entry #${entry.id}.`);
     return 0;
   }

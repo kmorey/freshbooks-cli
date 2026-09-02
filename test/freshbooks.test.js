@@ -43,10 +43,12 @@ test("normalizes project/client joins and logged time entries for plugins", asyn
     active: true, complete: false, internal: false,
     services: [{ id: 66, name: "Development", billable: true }],
   }]);
-  assert.deepEqual(presentTimeEntry({ id: 9, is_logged: true, started_at: "2026-09-02T12:00:00Z", duration: 90, project_id: 44, note: "Work" }), {
+  const normalized = presentTimeEntry({ id: 9, is_logged: true, started_at: "2026-09-02T12:00:00Z", duration: 90, project_id: 44, note: "Work" });
+  assert.deepEqual({ ...normalized, snapshotToken: undefined }, {
     id: 9, startedAt: "2026-09-02T12:00:00Z", localStartedAt: null, localDate: "2026-09-02",
-    durationSeconds: 90, projectId: 44, clientId: null, serviceId: null, note: "Work", billable: false, billed: false,
+    durationSeconds: 90, projectId: 44, clientId: null, serviceId: null, note: "Work", billable: false, billed: false, snapshotToken: undefined,
   });
+  assert.match(normalized.snapshotToken, /^[a-f0-9]{64}$/);
 });
 
 test("startTimer creates a timer identity then assigns project metadata", async () => {
@@ -108,6 +110,18 @@ test("pause closes the open segment and resume appends a segment", async () => {
   const resume = requests.find((request) => request.method === "POST");
   assert.deepEqual(resume.body.time_entry.timer, { id: 901 });
   assert.equal(resume.body.time_entry.duration, null);
+});
+
+test("timer mutations reject stale snapshots before writing", async () => {
+  let writes = 0;
+  const client = { async request(path, options = {}) {
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: [segment()] };
+    if (options.method) writes += 1;
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore, now });
+  await assert.rejects(service.pauseTimer(901, { snapshotToken: "stale" }), { code: "REMOTE_CHANGED" });
+  assert.equal(writes, 0);
 });
 
 test("running correction preserves closed duration and rebases the open segment", async () => {
