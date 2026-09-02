@@ -80,7 +80,10 @@ async function authCommand({ action, options, output, configStore, secretStore, 
   if (action === "configure") {
     const existingSecrets = await secretStore.read(config.profile);
     const clientId = options.clientId || config.clientId;
-    const clientSecret = options.clientSecret || existingSecrets.clientSecret;
+    const stdinValue = dependencies.readStdinValue || readStdinValue;
+    const clientSecret = options.clientSecretStdin
+      ? await stdinValue()
+      : options.clientSecret || existingSecrets.clientSecret;
     const redirectUri = options.redirectUri || config.redirectUri;
     if (!clientId) throw new CliError("Missing --client-id or FRESHBOOKS_CLIENT_ID", { exitCode: 2 });
     if (!clientSecret) {
@@ -115,6 +118,9 @@ async function authCommand({ action, options, output, configStore, secretStore, 
   if (action === "login") {
     const { url } = authorizationUrl(config);
     let code = options.code;
+    if (!code && options.codeStdin) {
+      code = await (dependencies.readStdinValue || readStdinValue)();
+    }
     if (!code) {
       if (options.json) {
         throw new CliError("Use `auth login --code <code-or-redirect-url> --json` for non-interactive login", {
@@ -223,12 +229,13 @@ async function diagnosticsCommand({ action, output, configStore, secretStore }) 
   const secrets = await secretStore.read(config.profile);
   const result = {
     version: PACKAGE_VERSION,
+    configured: Boolean(config.clientId && config.redirectUri && secrets.clientSecret),
     authenticated: Boolean(secrets.accessToken),
     businessSelected: Boolean(config.businessId),
     timezone: config.timezone,
     localDate: todayInTimezone(config.timezone),
     capabilities: [
-      "clients", "projects", "time-entries", "timer-segments", "timer-switch",
+      "clients", "projects", "time-entries", "timer-segments", "timer-switch", "popup-onboarding",
       "snapshot-guards", "local-calendar", "bounded-history",
     ],
   };
@@ -446,11 +453,20 @@ async function promptForCode(question) {
   }
 }
 
+async function readStdinValue() {
+  const readline = createInterface({ input: defaultStdin });
+  try {
+    return await readline.question("");
+  } finally {
+    readline.close();
+  }
+}
+
 const HELP = `freshbooks — FreshBooks time tracking from the shell
 
 Usage:
-  freshbooks auth configure --client-id ID --redirect-uri HTTPS_URL
-  freshbooks auth login [--no-browser] [--code CODE_OR_URL]
+  freshbooks auth configure --client-id ID --redirect-uri HTTPS_URL [--client-secret-stdin]
+  freshbooks auth login [--no-browser] [--code CODE_OR_URL] [--code-stdin]
   freshbooks auth status
   freshbooks auth logout
   freshbooks business list

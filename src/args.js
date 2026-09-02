@@ -3,6 +3,8 @@ import { CliError } from "./errors.js";
 const BOOLEAN_OPTIONS = new Set([
   "all",
   "billable",
+  "client-secret-stdin",
+  "code-stdin",
   "force",
   "help",
   "include-unlogged",

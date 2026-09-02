@@ -157,7 +157,8 @@ Recommended plugin behavior:
 - Poll `freshbooks timer status --json` every 15–30 seconds and immediately after actions.
 - Advance a running duration locally between polls instead of calling the API every second.
 - Treat `API_TIMEOUT` with `outcomeUnknown: true` as ambiguous and refresh before allowing another mutation.
-- Run authentication interactively outside the long-lived Quickshell process.
+- For in-popup onboarding, pass the OAuth client secret with `auth configure --client-secret-stdin --json` and the returned authorization URL with `auth login --code-stdin --json`.
+- Open the URL returned by `auth url --json` in the user's browser; never render or log its state parameter.
 - Do not read or copy the keyring contents into QML.
 
 Omarchy plugins run unsandboxed inside the long-lived shell, so keep the QML wrapper narrow and invoke only this executable with fixed argument arrays.
