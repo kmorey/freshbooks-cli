@@ -192,10 +192,10 @@ async function businessCommand({ action, argument, output, service }) {
 
 async function projectsCommand({ action, options, output, service }) {
   if (action !== "list") throw unknownAction("projects", action);
-  const projects = await service.projects({ all: options.all });
+  const projects = await service.projectRecords({ all: options.all });
   output.success(
     projects,
-    projects.map((project) => `${project.id}\t${project.title || project.name}`).join("\n") ||
+    projects.map((project) => `${project.id}\t${project.clientName}\t${project.title}`).join("\n") ||
       "No projects found.",
   );
   return 0;
@@ -292,7 +292,7 @@ async function timeCommand({ action, argument, options, output, service }) {
   if (action === "list") {
     const from = parseDate(options.from, "from");
     const to = parseDate(options.to, "to");
-    const entries = await service.listTimeEntries({
+    const entries = await service.timeEntryRecords({
       started_from: from?.toISOString(),
       started_to: to?.toISOString(),
       project_id: optionalInteger(options.project, "project"),
@@ -301,7 +301,7 @@ async function timeCommand({ action, argument, options, output, service }) {
     output.success(
       entries,
       entries
-        .map((entry) => `${entry.id}\t${entry.duration || 0}s\t${entry.note || ""}`)
+        .map((entry) => `${entry.id}\t${entry.durationSeconds}s\t${entry.note || ""}`)
         .join("\n") || "No time entries found.",
     );
     return 0;

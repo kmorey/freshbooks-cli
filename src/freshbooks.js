@@ -77,6 +77,49 @@ export class FreshBooksService {
     return projects;
   }
 
+  async clients() {
+    const selectedId = await this.businessId();
+    const business = (await this.businesses()).find(
+      (candidate) => Number(candidate.id) === Number(selectedId),
+    );
+    if (!business?.accountId) {
+      throw new CliError("The selected business has no accounting account identity", {
+        code: "INVALID_API_RESPONSE",
+      });
+    }
+    const clients = [];
+    let page = 1;
+    let pages = 1;
+    do {
+      const payload = await this.client.request(
+        `/accounting/account/${business.accountId}/users/clients`,
+        { query: { "search[vis_state]": 0, per_page: 100, page } },
+      );
+      const result = payload?.response?.result || payload;
+      clients.push(...(result?.clients || []));
+      pages = Number(result?.meta?.pages || 1);
+      page += 1;
+    } while (page <= pages);
+    return clients;
+  }
+
+  async projectRecords(options = {}) {
+    const [projects, clients] = await Promise.all([this.projects(options), this.clients()]);
+    const names = new Map(clients.map((client) => [Number(client.id), clientDisplayName(client)]));
+    return projects.map((project) => ({
+      id: project.id,
+      title: project.title || project.name || "",
+      clientId: project.client_id ?? null,
+      clientName: project.client_id == null ? "Internal" : names.get(Number(project.client_id)) || "",
+      active: project.active !== false,
+      complete: project.complete === true,
+      internal: project.internal === true,
+      services: (project.services || [])
+        .filter((service) => service.vis_state !== 1)
+        .map((service) => ({ id: service.id, name: service.name || "", billable: service.billable === true })),
+    }));
+  }
+
   async project(projectId) {
     const businessId = await this.businessId();
     const payload = await this.client.request(`/projects/business/${businessId}/project/${projectId}`);
@@ -116,6 +159,12 @@ export class FreshBooksService {
       `/timetracking/business/${businessId}/time_entries/${entryId}`,
     );
     return payload?.time_entry || payload;
+  }
+
+  async timeEntryRecords(filters = {}) {
+    return (await this.listTimeEntries(filters))
+      .filter((entry) => entry.is_logged === true)
+      .map(presentTimeEntry);
   }
 
   async createTimeEntry(fields) {
@@ -513,4 +562,28 @@ function assertTrackableProject(project, service, abilities = []) {
       code: "TIME_TRACKING_NOT_ALLOWED",
     });
   }
+}
+
+function clientDisplayName(client) {
+  const organization = String(client?.organization || "").trim();
+  if (organization) return organization;
+  return [client?.fname, client?.lname].filter(Boolean).join(" ").trim();
+}
+
+export function presentTimeEntry(entry) {
+  const startedAt = entry.started_at || null;
+  const localStartedAt = entry.local_started_at || null;
+  return {
+    id: entry.id,
+    startedAt,
+    localStartedAt,
+    localDate: String(localStartedAt || startedAt || "").slice(0, 10),
+    durationSeconds: Math.max(0, Number(entry.duration) || 0),
+    projectId: entry.project_id ?? null,
+    clientId: entry.client_id ?? null,
+    serviceId: entry.service_id ?? null,
+    note: entry.note || "",
+    billable: entry.billable === true,
+    billed: entry.billed === true,
+  };
 }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { FreshBooksService, groupTimerSegments } from "../src/freshbooks.js";
+import { FreshBooksService, groupTimerSegments, presentTimeEntry } from "../src/freshbooks.js";
 
 const businessId = 123;
 const now = () => new Date("2026-09-01T15:00:00Z");
@@ -28,6 +28,25 @@ test("groups timer segments by timer identity and ignores bare unlogged entries"
   assert.deepEqual(timers[0].segmentIds, [1, 2]);
   assert.equal(timers[0].running, true);
   assert.equal(timers[0].elapsedSeconds, 117);
+});
+
+test("normalizes project/client joins and logged time entries for plugins", async () => {
+  const client = { async request(path) {
+    if (path === "/auth/api/v1/users/me") return { response: { id: 88, business_memberships: [{ business: { id: 123, account_id: "abc", active: true } }] } };
+    if (path === "/projects/business/123/projects") return { projects: [{ id: 44, title: "Build", client_id: 55, active: true, services: [{ id: 66, name: "Development", billable: true, vis_state: 0 }] }] };
+    if (path === "/accounting/account/abc/users/clients") return { response: { result: { clients: [{ id: 55, organization: "Example Client" }] } } };
+    throw new Error(`Unexpected request: ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore });
+  assert.deepEqual(await service.projectRecords(), [{
+    id: 44, title: "Build", clientId: 55, clientName: "Example Client",
+    active: true, complete: false, internal: false,
+    services: [{ id: 66, name: "Development", billable: true }],
+  }]);
+  assert.deepEqual(presentTimeEntry({ id: 9, is_logged: true, started_at: "2026-09-02T12:00:00Z", duration: 90, project_id: 44, note: "Work" }), {
+    id: 9, startedAt: "2026-09-02T12:00:00Z", localStartedAt: null, localDate: "2026-09-02",
+    durationSeconds: 90, projectId: 44, clientId: null, serviceId: null, note: "Work", billable: false, billed: false,
+  });
 });
 
 test("startTimer creates a timer identity then assigns project metadata", async () => {
