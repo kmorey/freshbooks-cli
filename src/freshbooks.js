@@ -312,13 +312,14 @@ export class FreshBooksService {
 
   async timerCandidates() {
     const businessId = await this.businessId();
-    const identityId = (await this.identity()).id;
     // include_unlogged adds running/paused entries to the ordinary time-entry
-    // result set. Timer polling must stay bounded instead of traversing the
-    // account's complete history on every status check.
+    // result set and FreshBooks scopes the list to the authenticated user by
+    // default. Timer polling must stay bounded instead of traversing the
+    // account's complete history on every status check. Do not add an
+    // identity_id filter: FreshBooks rejects that combination with HTTP 422.
     const payload = await this.client.request(
       `/timetracking/business/${businessId}/time_entries`,
-      { query: { include_unlogged: true, identity_id: identityId, per_page: 100, page: 1 } },
+      { query: { include_unlogged: true, per_page: 100, page: 1 } },
     );
     return payload?.time_entries || [];
   }

@@ -253,18 +253,24 @@ test("logTimer preflights the project and PUTs the logical timer resource", asyn
   assert.equal(logged.elapsedSeconds, 60);
 });
 
-test("activeTimers makes one identity-scoped bounded request instead of paginating history", async () => {
+test("activeTimers omits the identity filter FreshBooks rejects while keeping polling bounded", async () => {
   let requests = 0;
   let query;
   const client = { async request(path, options = {}) {
     if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
-    if (path.includes("/time_entries")) { requests += 1; query = options.query; return { time_entries: [], meta: { page: 1, pages: 500 } }; }
+    if (path.includes("/time_entries")) {
+      requests += 1;
+      query = options.query;
+      if (query.identity_id !== undefined) throw new Error("FreshBooks API returned HTTP 422");
+      return { time_entries: [], meta: { page: 1, pages: 500 } };
+    }
     throw new Error(`Unexpected request: ${path}`);
   } };
   const service = new FreshBooksService({ client, configStore });
   assert.deepEqual(await service.activeTimers(), []);
   assert.equal(requests, 1);
-  assert.equal(query.identity_id, 88);
+  assert.equal(query.identity_id, undefined);
+  assert.equal(query.include_unlogged, true);
   assert.equal(query.per_page, 100);
 });
 
