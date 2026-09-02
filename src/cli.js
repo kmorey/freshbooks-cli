@@ -8,7 +8,7 @@ import { FreshBooksClient } from "./api.js";
 import { FreshBooksService } from "./freshbooks.js";
 import { authorizationUrl, exchangeAuthorizationCode } from "./auth.js";
 import { Output } from "./output.js";
-import { parseDate, parseDuration } from "./format.js";
+import { parseDate, parseDuration, parseRangeDate } from "./format.js";
 import { CliError } from "./errors.js";
 import { runProcess } from "./process.js";
 
@@ -290,8 +290,8 @@ async function timerCommand({ action, argument, options, output, service }) {
 async function timeCommand({ action, argument, options, output, service }) {
   const entryId = optionalInteger(argument, "entry-id");
   if (action === "list") {
-    const from = parseDate(options.from, "from");
-    const to = parseDate(options.to, "to");
+    const from = parseRangeDate(options.from, "from");
+    const to = parseRangeDate(options.to, "to", { endOfDay: true });
     const entries = await service.timeEntryRecords({
       started_from: from?.toISOString(),
       started_to: to?.toISOString(),
