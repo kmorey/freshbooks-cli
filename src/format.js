@@ -41,6 +41,14 @@ export function parseDate(value, flag) {
   return date;
 }
 
+export function parseRangeDate(value, flag, { endOfDay = false } = {}) {
+  if (value === undefined) return undefined;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return parseDate(value, flag);
+  const [year, month, day] = value.split("-").map(Number);
+  const boundary = new Date(year, month - 1, day + (endOfDay ? 1 : 0));
+  return endOfDay ? new Date(boundary.getTime() - 1) : boundary;
+}
+
 export function elapsedSeconds(entry, now = new Date()) {
   if (entry.is_logged === true || entry.timer?.is_running === false) {
     return Math.max(0, Number(entry.duration) || 0);

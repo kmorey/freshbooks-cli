@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { elapsedSeconds, formatDuration, parseDuration } from "../src/format.js";
+import { elapsedSeconds, formatDuration, parseDuration, parseRangeDate } from "../src/format.js";
 
 test("duration parsing supports compact shell-friendly values", () => {
   assert.equal(parseDuration("1h30m"), 5400);
@@ -29,4 +29,18 @@ test("elapsedSeconds trusts server duration when a timer is paused", () => {
     ),
     600,
   );
+});
+
+test("parseRangeDate includes the complete local final day", () => {
+  const start = parseRangeDate("2026-09-02", "from");
+  assert.equal(start.getDate(), 2);
+  assert.equal(start.getHours(), 0);
+  const end = parseRangeDate("2026-09-02", "to", { endOfDay: true });
+  assert.equal(end.getFullYear(), 2026);
+  assert.equal(end.getMonth(), 8);
+  assert.equal(end.getDate(), 2);
+  assert.equal(end.getHours(), 23);
+  assert.equal(end.getMinutes(), 59);
+  assert.equal(end.getSeconds(), 59);
+  assert.equal(end.getMilliseconds(), 999);
 });

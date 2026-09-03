@@ -20,6 +20,13 @@ test("parseArgs recognizes include-unlogged as a boolean", () => {
   assert.equal(parseArgs(["time", "list", "--include-unlogged"]).options.includeUnlogged, true);
 });
 
+test("parseArgs recognizes secret and authorization code stdin flags", () => {
+  assert.deepEqual(
+    parseArgs(["auth", "configure", "--client-secret-stdin", "--code-stdin"]).options,
+    { clientSecretStdin: true, codeStdin: true },
+  );
+});
+
 test("parseArgs recognizes the version flag without a command", () => {
   assert.equal(parseArgs(["--version"]).options.version, true);
 });

@@ -38,6 +38,10 @@ export class ConfigStore {
       apiBase: this.environment.FRESHBOOKS_API_BASE || stored.apiBase || "https://api.freshbooks.com",
       authBase: this.environment.FRESHBOOKS_AUTH_BASE || stored.authBase || "https://auth.freshbooks.com",
       profile: this.environment.FRESHBOOKS_PROFILE || stored.profile || "default",
+      timezone:
+        this.environment.FRESHBOOKS_TIMEZONE ||
+        stored.timezone ||
+        Intl.DateTimeFormat().resolvedOptions().timeZone,
     };
   }
 

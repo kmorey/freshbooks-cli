@@ -8,7 +8,7 @@ import { FreshBooksClient } from "./api.js";
 import { FreshBooksService } from "./freshbooks.js";
 import { authorizationUrl, exchangeAuthorizationCode } from "./auth.js";
 import { Output } from "./output.js";
-import { parseDate, parseDuration } from "./format.js";
+import { parseDate, parseDuration, parseRangeDate } from "./format.js";
 import { CliError } from "./errors.js";
 import { runProcess } from "./process.js";
 
@@ -53,6 +53,12 @@ export async function run(argv, dependencies = {}) {
     if (group === "projects") {
       return await projectsCommand({ action, options: parsed.options, output, service });
     }
+    if (group === "clients") {
+      return await clientsCommand({ action, output, service });
+    }
+    if (group === "diagnostics") {
+      return await diagnosticsCommand({ action, output, configStore, secretStore });
+    }
     if (group === "timer") {
       return await timerCommand({ action, argument, options: parsed.options, output, service });
     }
@@ -74,7 +80,10 @@ async function authCommand({ action, options, output, configStore, secretStore, 
   if (action === "configure") {
     const existingSecrets = await secretStore.read(config.profile);
     const clientId = options.clientId || config.clientId;
-    const clientSecret = options.clientSecret || existingSecrets.clientSecret;
+    const stdinValue = dependencies.readStdinValue || readStdinValue;
+    const clientSecret = options.clientSecretStdin
+      ? await stdinValue()
+      : options.clientSecret || existingSecrets.clientSecret;
     const redirectUri = options.redirectUri || config.redirectUri;
     if (!clientId) throw new CliError("Missing --client-id or FRESHBOOKS_CLIENT_ID", { exitCode: 2 });
     if (!clientSecret) {
@@ -109,6 +118,9 @@ async function authCommand({ action, options, output, configStore, secretStore, 
   if (action === "login") {
     const { url } = authorizationUrl(config);
     let code = options.code;
+    if (!code && options.codeStdin) {
+      code = await (dependencies.readStdinValue || readStdinValue)();
+    }
     if (!code) {
       if (options.json) {
         throw new CliError("Use `auth login --code <code-or-redirect-url> --json` for non-interactive login", {
@@ -192,17 +204,47 @@ async function businessCommand({ action, argument, output, service }) {
 
 async function projectsCommand({ action, options, output, service }) {
   if (action !== "list") throw unknownAction("projects", action);
-  const projects = await service.projects({ all: options.all });
+  const projects = await service.projectRecords({ all: options.all });
   output.success(
     projects,
-    projects.map((project) => `${project.id}\t${project.title || project.name}`).join("\n") ||
+    projects.map((project) => `${project.id}\t${project.clientName}\t${project.title}`).join("\n") ||
       "No projects found.",
   );
   return 0;
 }
 
+async function clientsCommand({ action, output, service }) {
+  if (action !== "list") throw unknownAction("clients", action);
+  const clients = await service.clientRecords();
+  output.success(
+    clients,
+    clients.map((client) => `${client.id}\t${client.name}`).join("\n") || "No clients found.",
+  );
+  return 0;
+}
+
+async function diagnosticsCommand({ action, output, configStore, secretStore }) {
+  if (action !== "status") throw unknownAction("diagnostics", action);
+  const config = await configStore.read();
+  const secrets = await secretStore.read(config.profile);
+  const result = {
+    version: PACKAGE_VERSION,
+    configured: Boolean(config.clientId && config.redirectUri && secrets.clientSecret),
+    authenticated: Boolean(secrets.accessToken),
+    businessSelected: Boolean(config.businessId),
+    timezone: config.timezone,
+    localDate: todayInTimezone(config.timezone),
+    capabilities: [
+      "clients", "projects", "time-entries", "timer-segments", "timer-switch", "popup-onboarding",
+      "snapshot-guards", "local-calendar", "bounded-history",
+    ],
+  };
+  output.success(result, `freshbooks ${PACKAGE_VERSION}: ${result.authenticated ? "authenticated" : "not authenticated"}`);
+  return 0;
+}
+
 async function timerCommand({ action, argument, options, output, service }) {
-  const entryId = optionalInteger(argument, "entry-id");
+  const timerId = optionalInteger(argument ?? options.id, "id");
   if (action === "status") {
     const timers = await service.activeTimers();
     output.success(
@@ -235,8 +277,42 @@ async function timerCommand({ action, argument, options, output, service }) {
     return 0;
   }
   if (action === "log") {
-    const entry = await service.logTimer(entryId);
+    const entry = await service.logTimer(timerId, { snapshotToken: options.snapshot });
     output.success(entry, `Logged ${entry.elapsed} to FreshBooks (#${entry.id}).`);
+    return 0;
+  }
+  if (action === "pause") {
+    const timer = await service.pauseTimer(timerId, { snapshotToken: options.snapshot });
+    output.success(timer, `Paused FreshBooks timer #${timer.id}.`);
+    return 0;
+  }
+  if (action === "resume") {
+    const timer = await service.resumeTimer(timerId, { snapshotToken: options.snapshot });
+    output.success(timer, `Resumed FreshBooks timer #${timer.id}.`);
+    return 0;
+  }
+  if (action === "correct") {
+    const duration = parseDuration(requireOption(options, "duration"));
+    const timer = await service.correctTimer(timerId, duration, { snapshotToken: options.snapshot });
+    output.success(timer, `Corrected FreshBooks timer #${timer.id} to ${timer.elapsed}.`);
+    return 0;
+  }
+  if (action === "update") {
+    if (options.note === undefined) {
+      throw new CliError("Provide --note to update a timer", { exitCode: 2 });
+    }
+    const timer = await service.updateTimer(timerId, { note: options.note }, { snapshotToken: options.snapshot });
+    output.success(timer, `Updated FreshBooks timer #${timer.id}.`);
+    return 0;
+  }
+  if (action === "switch") {
+    const result = await service.switchTimer(timerId, {
+      project_id: optionalInteger(options.project, "project"),
+      client_id: optionalInteger(options.client, "client"),
+      service_id: optionalInteger(options.service, "service"),
+      note: options.note,
+    }, { snapshotToken: options.snapshot });
+    output.success(result, `Switched to FreshBooks timer #${result.timer.id}.`);
     return 0;
   }
   if (action === "discard") {
@@ -246,15 +322,9 @@ async function timerCommand({ action, argument, options, output, service }) {
         exitCode: 2,
       });
     }
-    const result = await service.discardTimer(entryId);
+    const result = await service.discardTimer(timerId);
     output.success(result, `Discarded FreshBooks timer #${result.id}.`);
     return 0;
-  }
-  if (action === "pause" || action === "resume") {
-    throw new CliError(
-      `FreshBooks does not document public ${action} semantics. Start/status/log are supported; ${action} awaits live-account validation.`,
-      { code: "UNVERIFIED_TIMER_OPERATION", exitCode: 2 },
-    );
   }
   throw unknownAction("timer", action);
 }
@@ -262,29 +332,42 @@ async function timerCommand({ action, argument, options, output, service }) {
 async function timeCommand({ action, argument, options, output, service }) {
   const entryId = optionalInteger(argument, "entry-id");
   if (action === "list") {
-    const from = parseDate(options.from, "from");
-    const to = parseDate(options.to, "to");
-    const entries = await service.listTimeEntries({
+    const from = options.from === undefined
+      ? undefined
+      : (/^\d{4}-\d{2}-\d{2}$/.test(options.from)
+          ? await service.localRangeBoundary(options.from)
+          : parseRangeDate(options.from, "from"));
+    const to = options.to === undefined
+      ? undefined
+      : (/^\d{4}-\d{2}-\d{2}$/.test(options.to)
+          ? await service.localRangeBoundary(options.to, { endOfDay: true })
+          : parseRangeDate(options.to, "to", { endOfDay: true }));
+    const limit = optionalInteger(options.limit, "limit");
+    const entries = await service.timeEntryRecords({
       started_from: from?.toISOString(),
       started_to: to?.toISOString(),
       project_id: optionalInteger(options.project, "project"),
       include_unlogged: options.includeUnlogged,
-    });
+      ...(limit ? { sort: "started_at_desc", per_page: Math.min(100, limit) } : {}),
+    }, { limit });
     output.success(
       entries,
       entries
-        .map((entry) => `${entry.id}\t${entry.duration || 0}s\t${entry.note || ""}`)
+        .map((entry) => `${entry.id}\t${entry.durationSeconds}s\t${entry.note || ""}`)
         .join("\n") || "No time entries found.",
     );
     return 0;
   }
   if (action === "add") {
     const duration = parseDuration(requireOption(options, "duration"));
-    const startedAt = parseDate(options.startedAt || new Date().toISOString(), "started-at");
+    const localDateFields = options.date ? await service.localDateFields(options.date) : {};
+    const startedAt = parseDate(options.startedAt || localDateFields.started_at || new Date().toISOString(), "started-at");
     const entry = await service.createTimeEntry({
       is_logged: true,
       duration,
       started_at: startedAt.toISOString(),
+      local_started_at: localDateFields.local_started_at,
+      local_timezone: localDateFields.local_timezone,
       project_id: optionalInteger(options.project, "project"),
       client_id: optionalInteger(options.client, "client"),
       service_id: optionalInteger(options.service, "service"),
@@ -296,9 +379,12 @@ async function timeCommand({ action, argument, options, output, service }) {
   }
   if (action === "update") {
     if (!entryId) throw new CliError("Usage: freshbooks time update <id> [options]", { exitCode: 2 });
+    const localDateFields = options.date ? await service.localDateFields(options.date) : {};
     const patch = {
       duration: options.duration === undefined ? undefined : parseDuration(options.duration),
-      started_at: parseDate(options.startedAt, "started-at")?.toISOString(),
+      started_at: parseDate(options.startedAt || localDateFields.started_at, "started-at")?.toISOString(),
+      local_started_at: localDateFields.local_started_at,
+      local_timezone: localDateFields.local_timezone,
       project_id: optionalInteger(options.project, "project"),
       client_id: optionalInteger(options.client, "client"),
       service_id: optionalInteger(options.service, "service"),
@@ -308,7 +394,7 @@ async function timeCommand({ action, argument, options, output, service }) {
     if (Object.values(patch).every((value) => value === undefined)) {
       throw new CliError("Provide at least one field to update", { exitCode: 2 });
     }
-    const entry = await service.updateTimeEntry(entryId, patch);
+    const entry = await service.updateTimeEntry(entryId, patch, { snapshotToken: options.snapshot });
     output.success(entry, `Updated FreshBooks time entry #${entry.id}.`);
     return 0;
   }
@@ -320,7 +406,7 @@ async function timeCommand({ action, argument, options, output, service }) {
         exitCode: 2,
       });
     }
-    const result = await service.deleteTimeEntry(entryId);
+    const result = await service.deleteTimeEntry(entryId, { snapshotToken: options.snapshot });
     output.success(result, `Deleted FreshBooks time entry #${entryId}.`);
     return 0;
   }
@@ -346,6 +432,14 @@ function assertHttpsRedirect(value) {
   }
 }
 
+function todayInTimezone(timezone) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date()).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
 async function openBrowser(url) {
   await runProcess("xdg-open", [url]);
 }
@@ -359,24 +453,40 @@ async function promptForCode(question) {
   }
 }
 
+async function readStdinValue() {
+  const readline = createInterface({ input: defaultStdin });
+  try {
+    return await readline.question("");
+  } finally {
+    readline.close();
+  }
+}
+
 const HELP = `freshbooks — FreshBooks time tracking from the shell
 
 Usage:
-  freshbooks auth configure --client-id ID --redirect-uri HTTPS_URL
-  freshbooks auth login [--no-browser] [--code CODE_OR_URL]
+  freshbooks auth configure --client-id ID --redirect-uri HTTPS_URL [--client-secret-stdin]
+  freshbooks auth login [--no-browser] [--code CODE_OR_URL] [--code-stdin]
   freshbooks auth status
   freshbooks auth logout
   freshbooks business list
   freshbooks business use ID
   freshbooks projects list [--all]
+  freshbooks clients list
+  freshbooks diagnostics status
   freshbooks timer status
-  freshbooks timer start [--project ID] [--client ID] [--service ID] [--note TEXT] [--billable]
-  freshbooks timer log [ENTRY_ID]
-  freshbooks timer discard [ENTRY_ID] --yes
-  freshbooks time list [--from DATE] [--to DATE] [--project ID]
-  freshbooks time add --duration 1h30m [--started-at DATE] [--project ID] [--note TEXT]
-  freshbooks time update ENTRY_ID [--duration 45m] [--note TEXT]
-  freshbooks time delete ENTRY_ID --yes
+  freshbooks timer start --project ID --service ID [--note TEXT]
+  freshbooks timer pause [--id TIMER_ID]
+  freshbooks timer resume [--id TIMER_ID]
+  freshbooks timer correct --duration SECONDS [--id TIMER_ID]
+  freshbooks timer update --note TEXT [--id TIMER_ID]
+  freshbooks timer log [--id TIMER_ID]
+  freshbooks timer switch --project ID --service ID [--id TIMER_ID]
+  freshbooks timer discard [--id TIMER_ID] --yes
+  freshbooks time list [--from DATE] [--to DATE] [--project ID] [--limit COUNT]
+  freshbooks time add --duration 1h30m [--date YYYY-MM-DD] [--project ID] [--note TEXT]
+  freshbooks time update ENTRY_ID [--date YYYY-MM-DD] [--duration 45m] [--note TEXT]
+  freshbooks time delete ENTRY_ID --snapshot TOKEN --yes
 
 Options:
   --json       Emit one stable JSON object for Quickshell and scripts
@@ -385,5 +495,6 @@ Options:
 
 Environment overrides:
   FRESHBOOKS_CLIENT_ID, FRESHBOOKS_CLIENT_SECRET, FRESHBOOKS_REDIRECT_URI
+  FRESHBOOKS_TIMEZONE (IANA name, for example America/Chicago)
   FRESHBOOKS_ACCESS_TOKEN, FRESHBOOKS_REFRESH_TOKEN, FRESHBOOKS_TOKEN_EXPIRES_AT
   FRESHBOOKS_BUSINESS_ID, FRESHBOOKS_PROFILE`;

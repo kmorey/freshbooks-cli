@@ -13,11 +13,9 @@ The CLI uses FreshBooks' public OAuth 2.0 and time-entry APIs. A timer started h
 - Credentials stored in the desktop Secret Service when available
 - Business discovery and selection
 - Project listing
-- FreshBooks-backed timer start, status, log, and discard
+- FreshBooks-backed timer start, pause, resume, correction, switch, log, and discard
 - Time-entry list, create, update, and delete
-- Stable one-line JSON envelopes for QML and scripts
-
-Pause and resume are intentionally not exposed yet. FreshBooks supports them in its products, but its public API reference does not document their request semantics. A timer created by this CLI can still be paused or logged in FreshBooks. We will validate CLI-driven pause/resume against a real account before adding those commands.
+- Versioned, one-line JSON envelopes for QML and scripts
 
 ## Install
 
@@ -79,27 +77,39 @@ If Secret Service cannot be reached—for example, from a terminal without an in
 
 ```bash
 freshbooks projects list
-freshbooks timer start --project 12345 --note 'Implement time widget' --billable
+freshbooks clients list
+freshbooks timer start --project 12345 --service 67890 --note 'Implement time widget'
 freshbooks timer status
+freshbooks timer pause
+freshbooks timer resume
+freshbooks timer correct --duration 1h30m
 freshbooks timer log
 ```
 
-`timer start` refuses to create another timer when an unlogged timer already exists. `--force` overrides this guard. If multiple unlogged timers exist, pass an entry ID to `timer log` or `timer discard`.
+`timer status` groups Time Entries by timer identity and only exposes groups that still contain an unlogged segment. A pause closes the current unlogged segment; resume adds another segment to the same logical timer. When a logged entry is resumed, its duration is included in the displayed aggregate as `continuedSeconds`, while timer mutations remain limited to `activeSegmentIds`. `timer start` refuses to create another logical timer when one already exists. If multiple logical timers exist, pass `--id TIMER_ID` to mutations.
+
+Starting a timer derives client, internal, and billability fields from the selected project and service. Switching logs the current timer before starting the next one:
+
+```bash
+freshbooks timer switch --id 456 --project 23456 --service 78901
+```
 
 Discard is destructive and requires confirmation:
 
 ```bash
-freshbooks timer discard 98765 --yes
+freshbooks timer discard --id 456 --yes
 ```
 
 ## Time entries
 
 ```bash
 freshbooks time list --from 2026-09-01 --to 2026-09-02
-freshbooks time add --duration 1h30m --project 12345 --note 'Planning'
-freshbooks time update 98765 --duration 1h45m --note 'Planning and review'
-freshbooks time delete 98765 --yes
+freshbooks time add --date 2026-09-02 --duration 1h30m --project 12345 --service 67890 --note 'Planning'
+freshbooks time update 98765 --date 2026-09-03 --duration 1h45m --note 'Planning and review'
+freshbooks time delete 98765 --snapshot SNAPSHOT_TOKEN --yes
 ```
+
+Calendar dates use the configured FreshBooks timezone, including daylight-saving transitions. Set `FRESHBOOKS_TIMEZONE` to the account's IANA timezone (for example, `America/Chicago`) when it differs from the machine timezone. Entry create and project/service changes derive client, internal, and billability fields from the selected FreshBooks project service.
 
 ## Quickshell contract
 
@@ -107,13 +117,17 @@ Add `--json` to any command. Exactly one JSON object is written to standard outp
 
 ```json
 {
+  "schemaVersion": 1,
   "ok": true,
   "data": {
     "active": true,
     "timers": [
       {
-        "id": 98765,
+        "id": 456,
         "timerId": 456,
+        "segmentIds": [98764, 98765],
+        "activeSegmentIds": [98765],
+        "continuedSeconds": 1800,
         "running": true,
         "isLogged": false,
         "startedAt": "2026-09-01T14:00:00Z",
@@ -131,6 +145,7 @@ Errors are written to standard error with a non-zero exit status:
 
 ```json
 {
+  "schemaVersion": 1,
   "ok": false,
   "error": {
     "code": "AUTH_REQUIRED",
@@ -143,7 +158,9 @@ Recommended plugin behavior:
 
 - Poll `freshbooks timer status --json` every 15–30 seconds and immediately after actions.
 - Advance a running duration locally between polls instead of calling the API every second.
-- Run authentication interactively outside the long-lived Quickshell process.
+- Treat `API_TIMEOUT` with `outcomeUnknown: true` as ambiguous and refresh before allowing another mutation.
+- For in-popup onboarding, pass the OAuth client secret with `auth configure --client-secret-stdin --json` and the returned authorization URL with `auth login --code-stdin --json`.
+- Open the URL returned by `auth url --json` in the user's browser; never render or log its state parameter.
 - Do not read or copy the keyring contents into QML.
 
 Omarchy plugins run unsandboxed inside the long-lived shell, so keep the QML wrapper narrow and invoke only this executable with fixed argument arrays.

@@ -9,7 +9,7 @@ export class Output {
 
   success(data, humanText) {
     if (this.json) {
-      this.stdout.write(`${JSON.stringify({ ok: true, data })}\n`);
+      this.stdout.write(`${JSON.stringify({ schemaVersion: 1, ok: true, data })}\n`);
     } else if (humanText) {
       this.stdout.write(`${humanText}\n`);
     } else if (data !== undefined) {
@@ -22,11 +22,13 @@ export class Output {
     if (this.json) {
       this.stderr.write(
         `${JSON.stringify({
+          schemaVersion: 1,
           ok: false,
           error: {
             code: error.code,
             message: error.message,
             ...(error.status === undefined ? {} : { status: error.status }),
+            ...(error.outcomeUnknown ? { outcomeUnknown: true } : {}),
             ...(error.details === undefined ? {} : { details: error.details }),
           },
         })}\n`,

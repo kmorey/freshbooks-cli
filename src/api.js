@@ -3,11 +3,12 @@ import { ApiError, CliError } from "./errors.js";
 import { refreshAccessToken, withRefreshLock } from "./auth.js";
 
 export class FreshBooksClient {
-  constructor({ configStore, secretStore, fetcher = fetch, now = () => new Date() }) {
+  constructor({ configStore, secretStore, fetcher = fetch, now = () => new Date(), timeoutMs = 15000 }) {
     this.configStore = configStore;
     this.secretStore = secretStore;
     this.fetcher = fetcher;
     this.now = now;
+    this.timeoutMs = timeoutMs;
   }
 
   async request(
@@ -27,11 +28,29 @@ export class FreshBooksClient {
     };
     if (body !== undefined) headers["Content-Type"] = "application/json";
 
-    const response = await this.fetcher(url, {
-      method,
-      headers,
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    });
+    let response;
+    try {
+      response = await this.fetcher(url, {
+        method,
+        headers,
+        signal: AbortSignal.timeout(this.timeoutMs),
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+    } catch (error) {
+      if (error?.name === "AbortError" || error?.name === "TimeoutError") {
+        throw new CliError("FreshBooks API request timed out", {
+          code: "API_TIMEOUT",
+          exitCode: 3,
+          outcomeUnknown: method !== "GET",
+        });
+      }
+      throw new CliError("FreshBooks API transport failed", {
+        code: "API_TRANSPORT",
+        exitCode: 3,
+        outcomeUnknown: method !== "GET",
+        details: { cause: error instanceof Error ? error.message : String(error) },
+      });
+    }
 
     if (response.status === 401 && retryAuth) {
       await this.forceRefresh(config, { rejectedToken: token });
@@ -62,6 +81,7 @@ export class FreshBooksClient {
       throw new ApiError(apiMessage(payload, response.status), {
         status: response.status,
         details: payload,
+        outcomeUnknown: method !== "GET" && response.status >= 500,
       });
     }
     return payload;
