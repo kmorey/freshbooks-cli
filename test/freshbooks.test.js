@@ -30,6 +30,29 @@ test("groups timer segments by timer identity and ignores bare unlogged entries"
   assert.equal(timers[0].elapsedSeconds, 117);
 });
 
+test("includes a logged entry in the total when its timer is being continued", () => {
+  const timers = groupTimerSegments([
+    segment({ id: 1, is_logged: true, duration: 7200, started_at: "2026-09-01T12:00:00Z", timer: { id: 901, is_running: false } }),
+    segment({ id: 2, duration: null, started_at: "2026-09-01T14:59:00Z" }),
+  ], now());
+
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].elapsedSeconds, 7260);
+  assert.equal(timers[0].continuedSeconds, 7200);
+  assert.deepEqual(timers[0].segmentIds, [1, 2]);
+  assert.deepEqual(timers[0].activeSegmentIds, [2]);
+  assert.equal(timers[0].segments[0].isLogged, true);
+  assert.equal(timers[0].segments[1].isLogged, false);
+});
+
+test("does not surface a timer after all of its entries are logged", () => {
+  const timers = groupTimerSegments([
+    segment({ id: 1, is_logged: true, duration: 7200, timer: { id: 901, is_running: false } }),
+  ], now());
+
+  assert.deepEqual(timers, []);
+});
+
 test("normalizes project/client joins and logged time entries for plugins", async () => {
   const client = { async request(path) {
     if (path === "/auth/api/v1/users/me") return { response: { id: 88, business_memberships: [{ business: { id: 123, account_id: "abc", active: true } }] } };
@@ -233,9 +256,38 @@ test("running correction preserves closed duration and rebases the open segment"
   assert.equal(requests.filter((request) => request.method === "PUT").length, 2);
 });
 
+test("running correction treats a logged continuation predecessor as immutable", async () => {
+  const requests = [];
+  let entries = [
+    segment({ id: 899, is_logged: true, duration: 300, started_at: "2026-09-01T14:00:00Z", timer: { id: 901, is_running: false } }),
+    segment({ id: 900, duration: null, started_at: "2026-09-01T14:59:00Z" }),
+  ];
+  const client = { async request(path, options = {}) {
+    requests.push({ path, ...options });
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
+    if (options.method === "PUT") {
+      const id = Number(path.split("/").at(-1));
+      entries = entries.map((entry) => entry.id === id ? { ...entry, ...options.body.time_entry } : entry);
+      return { time_entry: entries.find((entry) => entry.id === id) };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore, now });
+
+  const corrected = await service.correctTimer(901, 600);
+
+  assert.equal(corrected.elapsedSeconds, 600);
+  assert.equal(entries[0].duration, 300);
+  assert.equal(entries[1].started_at, "2026-09-01T14:55:00.000Z");
+  assert.equal(requests.filter((request) => request.method === "PUT").length, 1);
+});
+
 test("logTimer preflights the project and PUTs the logical timer resource", async () => {
   const requests = [];
-  const entries = [segment({ duration: 60, timer: { id: 901, is_running: false } })];
+  const entries = [
+    segment({ id: 899, is_logged: true, duration: 7200, started_at: "2026-09-01T12:00:00Z", timer: { id: 901, is_running: false } }),
+    segment({ id: 900, duration: 60, timer: { id: 901, is_running: false } }),
+  ];
   const client = { async request(path, options = {}) {
     requests.push({ path, ...options });
     if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
@@ -248,9 +300,10 @@ test("logTimer preflights the project and PUTs the logical timer resource", asyn
   const logged = await service.logTimer(901);
   const update = requests.find((request) => request.path.endsWith("/timers/901"));
   assert.equal(update.body.timer.time_entries.length, 1);
+  assert.equal(update.body.timer.time_entries[0].id, undefined);
   assert.equal(update.body.timer.time_entries[0].is_logged, false);
   assert.equal(logged.timerId, 901);
-  assert.equal(logged.elapsedSeconds, 60);
+  assert.equal(logged.elapsedSeconds, 7260);
 });
 
 test("activeTimers omits the identity filter FreshBooks rejects while keeping polling bounded", async () => {

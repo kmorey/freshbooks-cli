@@ -86,7 +86,7 @@ freshbooks timer correct --duration 1h30m
 freshbooks timer log
 ```
 
-`timer status` groups FreshBooks' unlogged Time Entry segments by timer identity. A pause closes the open segment; resume adds another segment to the same logical timer. `timer start` refuses to create another logical timer when one already exists. If multiple logical timers exist, pass `--id TIMER_ID` to mutations.
+`timer status` groups Time Entries by timer identity and only exposes groups that still contain an unlogged segment. A pause closes the current unlogged segment; resume adds another segment to the same logical timer. When a logged entry is resumed, its duration is included in the displayed aggregate as `continuedSeconds`, while timer mutations remain limited to `activeSegmentIds`. `timer start` refuses to create another logical timer when one already exists. If multiple logical timers exist, pass `--id TIMER_ID` to mutations.
 
 Starting a timer derives client, internal, and billability fields from the selected project and service. Switching logs the current timer before starting the next one:
 
@@ -125,7 +125,9 @@ Add `--json` to any command. Exactly one JSON object is written to standard outp
       {
         "id": 456,
         "timerId": 456,
-        "segmentIds": [98765],
+        "segmentIds": [98764, 98765],
+        "activeSegmentIds": [98765],
+        "continuedSeconds": 1800,
         "running": true,
         "isLogged": false,
         "startedAt": "2026-09-01T14:00:00Z",

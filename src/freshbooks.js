@@ -428,7 +428,9 @@ export class FreshBooksService {
       });
     }
     const closed = timer._segments.filter((segment) => segment.duration != null);
-    const closedSeconds = closed.reduce((total, segment) => total + Number(segment.duration || 0), 0);
+    const continuedSeconds = Math.max(0, Number(timer.continuedSeconds) || 0);
+    const closedSeconds = continuedSeconds
+      + closed.reduce((total, segment) => total + Number(segment.duration || 0), 0);
     if (timer.running) {
       if (targetSeconds < closedSeconds) {
         throw new CliError("Duration cannot be shorter than completed timer segments", {
@@ -444,7 +446,8 @@ export class FreshBooksService {
       }
     } else {
       const last = closed.at(-1);
-      const priorSeconds = closed.slice(0, -1).reduce((total, segment) => total + Number(segment.duration || 0), 0);
+      const priorSeconds = continuedSeconds
+        + closed.slice(0, -1).reduce((total, segment) => total + Number(segment.duration || 0), 0);
       if (!last || targetSeconds < priorSeconds) {
         throw new CliError("Duration cannot be shorter than earlier timer segments", {
           code: "DURATION_BELOW_CLOSED_SEGMENTS",
@@ -515,7 +518,7 @@ export class FreshBooksService {
   async discardTimer(timerId) {
     const timer = await this.activeTimer(timerId);
     for (const segment of timer._segments) await this.deleteTimeEntry(segment.id);
-    return { id: timer.id, segmentIds: timer.segmentIds, deleted: true };
+    return { id: timer.id, segmentIds: timer.activeSegmentIds, deleted: true };
   }
 
   async updateTimerSegment(segment, patch) {
@@ -599,28 +602,40 @@ export function presentTimer(entry, now = new Date()) {
 export function groupTimerSegments(entries, now = new Date()) {
   const grouped = new Map();
   for (const entry of entries || []) {
-    if (entry?.is_logged !== false || entry?.timer?.id == null) continue;
+    if (entry?.timer?.id == null) continue;
     const key = Number(entry.timer.id);
-    if (!grouped.has(key)) grouped.set(key, []);
-    grouped.get(key).push(entry);
+    if (!grouped.has(key)) grouped.set(key, new Map());
+    grouped.get(key).set(String(entry.id), entry);
   }
-  return [...grouped.entries()].map(([timerId, segments]) => {
+  return [...grouped.entries()].flatMap(([timerId, entriesById]) => {
+    const segments = [...entriesById.values()];
     segments.sort((left, right) => new Date(left.started_at) - new Date(right.started_at));
-    const openSegments = segments.filter((segment) => segment.duration == null);
-    const current = openSegments.at(-1) || segments.at(-1);
+    const activeSegments = segments.filter((segment) => segment.is_logged === false);
+    if (activeSegments.length === 0) return [];
+    const continuedSegments = segments.filter((segment) => segment.is_logged === true);
+    const openSegments = activeSegments.filter((segment) => segment.duration == null);
+    const current = openSegments.at(-1) || activeSegments.at(-1);
+    const continuedSeconds = continuedSegments.reduce(
+      (total, segment) => total + Math.max(0, Number(segment.duration) || 0),
+      0,
+    );
     const elapsed = segments.reduce(
-      (total, segment) => total + (segment.duration == null ? elapsedSeconds(segment, now) : Math.max(0, Number(segment.duration) || 0)),
+      (total, segment) => total + (segment.duration == null && segment.is_logged === false
+        ? elapsedSeconds(segment, now)
+        : Math.max(0, Number(segment.duration) || 0)),
       0,
     );
     const timer = {
       id: timerId,
       timerId,
       segmentIds: segments.map((segment) => segment.id),
+      activeSegmentIds: activeSegments.map((segment) => segment.id),
       segments: segments.map(presentTimerSegment),
       openSegment: openSegments.length ? presentTimerSegment(openSegments.at(-1)) : null,
       running: openSegments.length > 0,
       isLogged: false,
       startedAt: segments[0]?.started_at,
+      continuedSeconds,
       elapsedSeconds: elapsed,
       elapsed: formatDuration(elapsed),
       projectId: current?.project_id,
@@ -631,10 +646,11 @@ export function groupTimerSegments(entries, now = new Date()) {
       snapshotToken: logicalTimerSnapshot(segments),
     };
     Object.defineProperties(timer, {
-      _segments: { value: segments },
+      _segments: { value: activeSegments },
+      _continuedSegments: { value: continuedSegments },
       _openSegment: { value: openSegments.at(-1) || null },
     });
-    return timer;
+    return [timer];
   });
 }
 
@@ -644,7 +660,8 @@ function presentTimerSegment(segment) {
     startedAt: segment.started_at,
     localStartedAt: segment.local_started_at ?? null,
     durationSeconds: segment.duration == null ? null : Math.max(0, Number(segment.duration) || 0),
-    running: segment.duration == null,
+    running: segment.is_logged === false && segment.duration == null,
+    isLogged: segment.is_logged === true,
   };
 }
 
