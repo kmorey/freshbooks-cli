@@ -65,6 +65,79 @@ test("JSON output preserves all guard rejection detail fields", () => {
   assert.equal(stdout.value, "");
 });
 
+test("timer guard requires an explicit canonical identity before reading", async () => {
+  const stdout = sink();
+  const stderr = sink();
+  let reads = 0;
+  const configStore = { async read() {
+    reads += 1;
+    return { businessId: 123, timezone: "America/Chicago" };
+  } };
+
+  assert.equal(await run(["timer", "pause", "--guard", "stale", "--json"], {
+    stdout,
+    stderr,
+    configStore,
+    client: { async request() { throw new Error("Timer API must not be read"); } },
+  }), 2);
+  assert.deepEqual(JSON.parse(stderr.value), {
+    schemaVersion: 1,
+    ok: false,
+    error: {
+      code: "INVALID_ARGUMENT",
+      message: "Guarded timer mutations require --id",
+    },
+  });
+  assert.equal(reads, 0);
+});
+
+test("disappeared guarded timer returns canonical deleted details without writing", async () => {
+  const stdout = sink();
+  const stderr = sink();
+  let writes = 0;
+  const configStore = { async read() {
+    return { businessId: 123, timezone: "America/Chicago" };
+  } };
+  const client = { async request(path, options = {}) {
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: [] };
+    if (options.method) writes += 1;
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+
+  assert.equal(await run([
+    "timer", "pause", "--id", "901", "--guard", "stale", "--json",
+  ], {
+    stdout,
+    stderr,
+    configStore,
+    client,
+    now: () => new Date("2026-09-01T15:00:00Z"),
+  }), 1);
+  assert.deepEqual(JSON.parse(stderr.value), {
+    schemaVersion: 1,
+    ok: false,
+    error: {
+      code: "GUARD_REJECTED",
+      message: "The FreshBooks record changed since it was loaded",
+      details: {
+        contractVersion: 2,
+        identity: { kind: "active-timer", id: "901" },
+        expectedToken: "stale",
+        currentToken: null,
+        current: {
+          contractVersion: 2,
+          kind: "active-timer",
+          id: "901",
+          exists: false,
+          token: null,
+        },
+      },
+    },
+  });
+  assert.equal(writes, 0);
+  assert.equal(stdout.value, "");
+});
+
 test("diagnostics status is non-interactive and bounded", async () => {
   const stdout = sink();
   const stderr = sink();

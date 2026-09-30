@@ -294,27 +294,31 @@ async function timerCommand({ action, argument, options, output, service, bindTr
     return 0;
   }
   if (action === "log") {
+    const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
-    const entry = await service.logTimer(timerId, { guard: options.guard });
+    const entry = await service.logTimer(timerId, { guard });
     output.success(entry, `Logged ${entry.elapsed} to FreshBooks (#${entry.id}).`);
     return 0;
   }
   if (action === "pause") {
+    const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
-    const timer = await service.pauseTimer(timerId, { guard: options.guard });
+    const timer = await service.pauseTimer(timerId, { guard });
     output.success(timer, `Paused FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "resume") {
+    const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
-    const timer = await service.resumeTimer(timerId, { guard: options.guard });
+    const timer = await service.resumeTimer(timerId, { guard });
     output.success(timer, `Resumed FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "correct") {
     const duration = parseDuration(requireOption(options, "duration"));
+    const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
-    const timer = await service.correctTimer(timerId, duration, { guard: options.guard });
+    const timer = await service.correctTimer(timerId, duration, { guard });
     output.success(timer, `Corrected FreshBooks timer #${timer.id} to ${timer.elapsed}.`);
     return 0;
   }
@@ -322,8 +326,9 @@ async function timerCommand({ action, argument, options, output, service, bindTr
     if (options.note === undefined) {
       throw new CliError("Provide --note to update a timer", { exitCode: 2 });
     }
+    const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
-    const timer = await service.updateTimer(timerId, { note: options.note }, { guard: options.guard });
+    const timer = await service.updateTimer(timerId, { note: options.note }, { guard });
     output.success(timer, `Updated FreshBooks timer #${timer.id}.`);
     return 0;
   }
@@ -334,8 +339,9 @@ async function timerCommand({ action, argument, options, output, service, bindTr
       service_id: optionalInteger(options.service, "service"),
       note: options.note,
     };
+    const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
-    const result = await service.switchTimer(timerId, fields, { guard: options.guard });
+    const result = await service.switchTimer(timerId, fields, { guard });
     output.success(result, `Switched to FreshBooks timer #${result.timer.id}.`);
     return 0;
   }
@@ -346,8 +352,9 @@ async function timerCommand({ action, argument, options, output, service, bindTr
         exitCode: 2,
       });
     }
+    const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
-    const result = await service.discardTimer(timerId, { guard: options.guard });
+    const result = await service.discardTimer(timerId, { guard });
     output.success(result, `Discarded FreshBooks timer #${result.id}.`);
     return 0;
   }
@@ -430,8 +437,9 @@ async function timeCommand({ action, argument, options, output, service, bindTra
     if (Object.values(patch).every((value) => value === undefined)) {
       throw new CliError("Provide at least one field to update", { exitCode: 2 });
     }
+    const guard = requireOption(options, "guard");
     service = await bindTracking();
-    const entry = await service.updateTimeEntry(entryId, patch, { guard: options.guard });
+    const entry = await service.updateTimeEntry(entryId, patch, { guard });
     output.success(entry, `Updated FreshBooks time entry #${entry.id}.`);
     return 0;
   }
@@ -443,12 +451,24 @@ async function timeCommand({ action, argument, options, output, service, bindTra
         exitCode: 2,
       });
     }
+    const guard = requireOption(options, "guard");
     service = await bindTracking();
-    const result = await service.deleteTimeEntry(entryId, { guard: options.guard });
+    const result = await service.deleteTimeEntry(entryId, { guard });
     output.success(result, `Deleted FreshBooks time entry #${entryId}.`);
     return 0;
   }
   throw unknownAction("time", action);
+}
+
+function requireTimerGuard(options, timerId) {
+  const guard = requireOption(options, "guard");
+  if (!timerId) {
+    throw new CliError("Guarded timer mutations require --id", {
+      code: "INVALID_ARGUMENT",
+      exitCode: 2,
+    });
+  }
+  return guard;
 }
 
 function canonicalTimerElapsed(timer) {
@@ -527,13 +547,13 @@ Usage:
   freshbooks diagnostics status
   freshbooks timer status
   freshbooks timer start --project ID --service ID [--note TEXT]
-  freshbooks timer pause [--id TIMER_ID] [--guard TOKEN]
-  freshbooks timer resume [--id TIMER_ID] [--guard TOKEN]
-  freshbooks timer correct --duration SECONDS [--id TIMER_ID] [--guard TOKEN]
-  freshbooks timer update --note TEXT [--id TIMER_ID] [--guard TOKEN]
-  freshbooks timer log [--id TIMER_ID] [--guard TOKEN]
-  freshbooks timer switch --project ID --service ID [--id TIMER_ID] [--guard TOKEN]
-  freshbooks timer discard [--id TIMER_ID] [--guard TOKEN] --yes
+  freshbooks timer pause --id TIMER_ID --guard TOKEN
+  freshbooks timer resume --id TIMER_ID --guard TOKEN
+  freshbooks timer correct --duration SECONDS --id TIMER_ID --guard TOKEN
+  freshbooks timer update --note TEXT --id TIMER_ID --guard TOKEN
+  freshbooks timer log --id TIMER_ID --guard TOKEN
+  freshbooks timer switch --project ID --service ID --id TIMER_ID --guard TOKEN
+  freshbooks timer discard --id TIMER_ID --guard TOKEN --yes
   freshbooks time list [--from DATE] [--to DATE] [--project ID] [--limit COUNT]
   freshbooks time add --duration 1h30m [--date YYYY-MM-DD] [--project ID] [--note TEXT]
   freshbooks time update ENTRY_ID [--date YYYY-MM-DD] [--duration 45m] [--note TEXT] [--guard TOKEN]

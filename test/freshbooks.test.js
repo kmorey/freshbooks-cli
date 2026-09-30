@@ -23,6 +23,18 @@ function sink() {
   return { value: "", write(chunk) { this.value += chunk; } };
 }
 
+function trackingContext() {
+  return new TrackingContext({
+    timezone: "America/Chicago",
+    observedAt: "2026-09-01T15:00:00Z",
+  });
+}
+
+async function currentTimerGuard(service, timerId = 901) {
+  await service.activeTimers();
+  return service.trackingContext.get(`active-timer:${timerId}`).token;
+}
+
 test("groups timer segments by timer identity and ignores bare unlogged entries", () => {
   const timers = groupTimerSegments([
     segment({ id: 1, duration: 57, started_at: "2026-09-01T14:00:00Z" }),
@@ -110,6 +122,67 @@ test("converts FreshBooks-local calendar dates at DST-aware boundaries", async (
     "2026-03-09T04:59:59.999Z",
   );
   await assert.rejects(service.localDateFields("2026-02-30"), { code: "INVALID_ARGUMENT" });
+});
+
+test("existing-record mutations require guards before writing", async () => {
+  let writes = 0;
+  const timeClient = { async request(path, options = {}) {
+    if (path.endsWith("/time_entries/9") && !options.method) {
+      return { time_entry: {
+        id: 9,
+        is_logged: true,
+        duration: 60,
+        started_at: "2026-09-02T12:00:00Z",
+      } };
+    }
+    if (options.method) {
+      writes += 1;
+      return {};
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const timerClient = { async request(path, options = {}) {
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: [segment()] };
+    if (options.method) {
+      writes += 1;
+      return {};
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const switchClient = { async request(path, options = {}) {
+    if (path === "/comments/business/123/project/44") {
+      return {
+        project: {
+          id: 44,
+          active: true,
+          complete: false,
+          services: [{ id: 66, billable: true }],
+        },
+        abilities: [{ name: "can_track_time", value: true }],
+      };
+    }
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: [] };
+    if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
+    if (options.method) writes += 1;
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+
+  await assert.rejects(
+    new FreshBooksService({ client: timeClient, configStore }).deleteTimeEntry(9),
+    { code: "GUARD_REQUIRED" },
+  );
+  await assert.rejects(
+    new FreshBooksService({ client: timerClient, configStore, now }).pauseTimer(901),
+    { code: "GUARD_REQUIRED" },
+  );
+  await assert.rejects(
+    new FreshBooksService({ client: switchClient, configStore, now }).switchTimer(
+      901,
+      { project_id: 44, service_id: 66 },
+    ),
+    { code: "GUARD_REQUIRED" },
+  );
+  assert.equal(writes, 0);
 });
 
 test("guard rejection returns complete canonical current state without writing", async () => {
@@ -260,14 +333,19 @@ test("pause closes the open segment and resume appends a segment", async () => {
     }
     throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
   } };
-  const service = new FreshBooksService({ client, configStore, now });
-  const paused = await service.pauseTimer(901);
+  const context = trackingContext();
+  const service = new FreshBooksService({ client, configStore, now }).withTracking(context);
+  const paused = await service.pauseTimer(901, {
+    guard: await currentTimerGuard(service),
+  });
   assert.equal(paused.running, false);
   assert.equal(paused.elapsedSeconds, 60);
   const pause = requests.find((request) => request.method === "PUT");
   assert.equal(pause.body.time_entry.duration, 60);
   assert.equal(pause.body.time_entry.timer.is_running, undefined);
-  const resumed = await service.resumeTimer(901);
+  const resumed = await service.resumeTimer(901, {
+    guard: context.get("active-timer:901").token,
+  });
   assert.equal(resumed.running, true);
   assert.deepEqual(resumed.segmentIds, [900, 902]);
   const resume = requests.find((request) => request.method === "POST");
@@ -317,8 +395,10 @@ test("running correction preserves closed duration and rebases the open segment"
     }
     throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
   } };
-  const service = new FreshBooksService({ client, configStore, now });
-  const corrected = await service.correctTimer(901, 600);
+  const service = new FreshBooksService({ client, configStore, now }).withTracking(trackingContext());
+  const corrected = await service.correctTimer(901, 600, {
+    guard: await currentTimerGuard(service),
+  });
   assert.equal(corrected.elapsedSeconds, 600);
   assert.equal(entries[0].duration, 57);
   assert.equal(entries[1].started_at, "2026-09-01T14:50:57.000Z");
@@ -341,9 +421,11 @@ test("running correction treats a logged continuation predecessor as immutable",
     }
     throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
   } };
-  const service = new FreshBooksService({ client, configStore, now });
+  const service = new FreshBooksService({ client, configStore, now }).withTracking(trackingContext());
 
-  const corrected = await service.correctTimer(901, 600);
+  const corrected = await service.correctTimer(901, 600, {
+    guard: await currentTimerGuard(service),
+  });
 
   assert.equal(corrected.elapsedSeconds, 600);
   assert.equal(entries[0].duration, 300);
@@ -365,8 +447,10 @@ test("logTimer preflights the project and PUTs the logical timer resource", asyn
     if (path === "/comments/business/123/timers/901" && options.method === "PUT") return { time_entry: { id: 903, is_logged: true, duration: 60 } };
     throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
   } };
-  const service = new FreshBooksService({ client, configStore, now });
-  const logged = await service.logTimer(901);
+  const service = new FreshBooksService({ client, configStore, now }).withTracking(trackingContext());
+  const logged = await service.logTimer(901, {
+    guard: await currentTimerGuard(service),
+  });
   const update = requests.find((request) => request.path.endsWith("/timers/901"));
   assert.equal(update.body.timer.time_entries.length, 1);
   assert.equal(update.body.timer.time_entries[0].id, undefined);
@@ -426,7 +510,14 @@ test("timer switch validates the target before logging current work", async () =
     throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
   } };
   const service = new FreshBooksService({ client, configStore, now });
-  await assert.rejects(service.switchTimer(901, { project_id: 99, service_id: 77 }), { code: "PROJECT_NOT_ACTIVE" });
+  await assert.rejects(
+    service.switchTimer(
+      901,
+      { project_id: 99, service_id: 77 },
+      { guard: "stale" },
+    ),
+    { code: "PROJECT_NOT_ACTIVE" },
+  );
   assert.equal(timerWrites, 0);
 });
 

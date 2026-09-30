@@ -261,7 +261,11 @@ export class FreshBooksService {
   }
 
   async deleteTimeEntry(entryId, { guard } = {}) {
-    const existing = await this.guardedTimeEntry(entryId, guard);
+    await this.guardedTimeEntry(entryId, guard);
+    return this.deleteTimeEntryRecord(entryId);
+  }
+
+  async deleteTimeEntryRecord(entryId) {
     const businessId = await this.businessId();
     await this.client.request(`/timetracking/business/${businessId}/time_entries/${entryId}`, {
       method: "DELETE",
@@ -556,12 +560,11 @@ export class FreshBooksService {
         exitCode: 2,
       });
     }
+    requireTimerMutationGuard(timerId, guard);
     const { project, abilities } = await this.timerProject(fields.project_id);
     const service = selectProjectService(project, fields.service_id);
     assertTrackableProject(project, service, abilities);
-    let logged = null;
-    const timers = await this.activeTimers();
-    if (timers.length > 0) logged = await this.logTimer(timerId, { guard });
+    const logged = await this.logTimer(timerId, { guard });
     try {
       const timer = await this.startTimer(fields);
       return { logged, timer, partial: false };
@@ -578,7 +581,7 @@ export class FreshBooksService {
 
   async discardTimer(timerId, { guard } = {}) {
     const timer = await this.guardedActiveTimer(timerId, guard);
-    for (const segment of timer._segments) await this.deleteTimeEntry(segment.id);
+    for (const segment of timer._segments) await this.deleteTimeEntryRecord(segment.id);
     return { id: timer.id, segmentIds: timer.activeSegmentIds, deleted: true };
   }
 
@@ -602,36 +605,36 @@ export class FreshBooksService {
     return timer;
   }
   async guardedTimeEntry(entryId, guard) {
+    requireMutationGuard(guard);
     let existing;
     try {
       existing = await this.timeEntry(entryId);
     } catch (error) {
-      if (guard !== undefined && error?.status === 404) {
+      if (error?.status === 404) {
         assertGuard(guard, canonicalDeleted("time-entry", entryId));
       }
       throw error;
     }
-    if (guard !== undefined) {
-      const context = this.requireTracking();
-      const current = context.remember(canonicalTimeEntry(existing, {
-        timezone: context.timezone,
-      }));
-      assertGuard(guard, current);
-    }
+    const context = this.requireTracking();
+    const current = context.remember(canonicalTimeEntry(existing, {
+      timezone: context.timezone,
+    }));
+    assertGuard(guard, current);
     return existing;
   }
 
   async guardedActiveTimer(timerId, guard) {
     let timer;
+    requireTimerMutationGuard(timerId, guard);
     try {
       timer = await this.activeTimer(timerId);
     } catch (error) {
-      if (guard !== undefined && timerId !== undefined && error?.code === "TIMER_NOT_ACTIVE") {
+      if (error?.code === "TIMER_NOT_ACTIVE") {
         assertGuard(guard, canonicalDeleted("active-timer", timerId));
       }
       throw error;
     }
-    if (guard !== undefined) assertGuard(guard, this.currentTimerRecord(timer));
+    assertGuard(guard, this.currentTimerRecord(timer));
     return timer;
   }
 
@@ -844,6 +847,23 @@ function validDateKey(value) {
   if (!match) return false;
   const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
   return date.toISOString().slice(0, 10) === value;
+}
+
+function requireMutationGuard(guard) {
+  if (typeof guard === "string" && guard.length > 0) return guard;
+  throw new CliError("A semantic guard is required for this mutation", {
+    code: "GUARD_REQUIRED",
+    exitCode: 2,
+  });
+}
+
+function requireTimerMutationGuard(timerId, guard) {
+  requireMutationGuard(guard);
+  if (timerId !== undefined) return;
+  throw new CliError("Guarded timer mutations require a canonical active-timer identity", {
+    code: "INVALID_ARGUMENT",
+    exitCode: 2,
+  });
 }
 
 export function presentTimeEntry(entry, { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone } = {}) {
