@@ -597,3 +597,27 @@ test("local usage errors do not read configuration to create tracking context", 
   assert.equal(configReads, 0);
   assert.match(JSON.parse(stderr.value).error.message, /Usage: freshbooks time delete/);
 });
+
+test("timer start reports missing project before reading tracking configuration", async () => {
+  let configReads = 0;
+  const stderr = sink();
+
+  assert.equal(await run(["timer", "start", "--force", "--json"], {
+    service: new FreshBooksService({ client: {}, configStore }),
+    configStore: {
+      async read() {
+        configReads += 1;
+        throw new Error("configuration should not be read");
+      },
+    },
+    secretStore: {},
+    stdout: sink(),
+    stderr,
+  }), 1);
+
+  assert.equal(configReads, 0);
+  assert.deepEqual(JSON.parse(stderr.value).error, {
+    code: "PROJECT_REQUIRED",
+    message: "Starting a timer requires a project",
+  });
+});

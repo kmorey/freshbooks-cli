@@ -282,6 +282,11 @@ async function timerCommand({ action, argument, options, output, service, bindTr
       billable: options.billable,
       started_at: startedAt?.toISOString(),
     };
+    if (!fields.project_id) {
+      throw new CliError("Starting a timer requires a project", {
+        code: "PROJECT_REQUIRED",
+      });
+    }
     service = await bindTracking();
     const timer = await service.startTimer(fields, { force: options.force });
     output.success(timer, `Started FreshBooks timer #${timer.id}.`);
