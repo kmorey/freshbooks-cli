@@ -72,12 +72,18 @@ test("normalizes project/client joins and logged time entries for plugins", asyn
     active: true, complete: false, internal: false,
     services: [{ id: 66, name: "Development", billable: true }],
   }]);
-  const normalized = presentTimeEntry({ id: 9, is_logged: true, started_at: "2026-09-02T12:00:00Z", duration: 90, project_id: 44, note: "Work" });
-  assert.deepEqual({ ...normalized, snapshotToken: undefined }, {
-    id: 9, startedAt: "2026-09-02T12:00:00Z", localStartedAt: null, localDate: "2026-09-02",
-    durationSeconds: 90, projectId: 44, clientId: null, serviceId: null, note: "Work", billable: false, billed: false, snapshotToken: undefined,
+  const normalized = presentTimeEntry({
+    id: 9,
+    is_logged: true,
+    started_at: "2026-09-02T12:00:00Z",
+    duration: 90,
+    project_id: 44,
+    note: "Work",
   });
-  assert.match(normalized.snapshotToken, /^[a-f0-9]{64}$/);
+  assert.deepEqual(normalized, {
+    id: 9, startedAt: "2026-09-02T12:00:00Z", localStartedAt: null, localDate: "2026-09-02",
+    durationSeconds: 90, projectId: 44, clientId: null, serviceId: null, note: "Work", billable: false, billed: false,
+  });
   assert.equal(
     presentTimeEntry({ id: 10, started_at: "2026-09-03T02:00:00Z", duration: 1 }, { timezone: "America/Chicago" }).localDate,
     "2026-09-02",
@@ -106,16 +112,59 @@ test("converts FreshBooks-local calendar dates at DST-aware boundaries", async (
   await assert.rejects(service.localDateFields("2026-02-30"), { code: "INVALID_ARGUMENT" });
 });
 
-test("deleteTimeEntry rejects a stale snapshot before DELETE", async () => {
-  let deletes = 0;
+test("guard rejection returns complete canonical current state without writing", async () => {
+  let writes = 0;
   const client = { async request(path, options = {}) {
-    if (path.endsWith("/time_entries/9") && !options.method) return { time_entry: { id: 9, is_logged: true, duration: 60, started_at: "2026-09-02T12:00:00Z" } };
-    if (options.method === "DELETE") deletes += 1;
+    if (path.endsWith("/time_entries/9") && !options.method) {
+      return { time_entry: {
+        id: 9,
+        is_logged: true,
+        duration: 60,
+        started_at: "2026-09-02T12:00:00Z",
+        project_id: 44,
+        client_id: 55,
+        service_id: 66,
+        note: "Current work",
+        billable: true,
+        billed: false,
+      } };
+    }
+    if (options.method) writes += 1;
     throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
   } };
-  const service = new FreshBooksService({ client, configStore });
-  await assert.rejects(service.deleteTimeEntry(9, { snapshotToken: "stale" }), { code: "REMOTE_CHANGED" });
-  assert.equal(deletes, 0);
+  const context = new TrackingContext({
+    timezone: "America/Chicago",
+    observedAt: "2026-09-02T12:01:30Z",
+  });
+  const service = new FreshBooksService({ client, configStore }).withTracking(context);
+
+  await assert.rejects(
+    service.deleteTimeEntry(9, { guard: "stale" }),
+    (error) => {
+      assert.equal(error.code, "GUARD_REJECTED");
+      assert.equal(error.details.expectedToken, "stale");
+      assert.match(error.details.currentToken, /^[a-f0-9]{64}$/);
+      assert.deepEqual(error.details.current, {
+        contractVersion: 2,
+        kind: "time-entry",
+        id: "9",
+        exists: true,
+        localDate: "2026-09-02",
+        startedAt: "2026-09-02T12:00:00.000Z",
+        durationSeconds: 60,
+        projectId: "44",
+        clientId: "55",
+        serviceId: "66",
+        note: "Current work",
+        billable: true,
+        billed: false,
+        token: error.details.currentToken,
+      });
+      assert.deepEqual(error.details.identity, { kind: "time-entry", id: "9" });
+      return true;
+    },
+  );
+  assert.equal(writes, 0);
 });
 
 test("logged entries derive client and billability from the selected project service", async () => {
@@ -141,7 +190,6 @@ test("logged entries derive client and billability from the selected project ser
   assert.equal(result.projectId, 44);
   assert.equal(result.clientId, 55);
   assert.equal(result.billable, true);
-  assert.match(result.snapshotToken, /^[a-f0-9]{64}$/);
 });
 
 test("internal project time remains non-billable even when its service is billable", async () => {
@@ -227,7 +275,7 @@ test("pause closes the open segment and resume appends a segment", async () => {
   assert.equal(resume.body.time_entry.duration, null);
 });
 
-test("timer mutations reject stale snapshots before writing", async () => {
+test("timer mutations reject stale guards before writing", async () => {
   let writes = 0;
   const client = { async request(path, options = {}) {
     if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
@@ -235,8 +283,23 @@ test("timer mutations reject stale snapshots before writing", async () => {
     if (options.method) writes += 1;
     throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
   } };
-  const service = new FreshBooksService({ client, configStore, now });
-  await assert.rejects(service.pauseTimer(901, { snapshotToken: "stale" }), { code: "REMOTE_CHANGED" });
+  const context = new TrackingContext({
+    timezone: "America/Chicago",
+    observedAt: "2026-09-01T15:00:00Z",
+  });
+  const service = new FreshBooksService({ client, configStore, now }).withTracking(context);
+  await assert.rejects(
+    service.pauseTimer(901, { guard: "stale" }),
+    (error) => {
+      assert.equal(error.code, "GUARD_REJECTED");
+      assert.equal(error.details.expectedToken, "stale");
+      assert.match(error.details.currentToken, /^[a-f0-9]{64}$/);
+      assert.equal(error.details.current.kind, "active-timer");
+      assert.equal(error.details.current.id, "901");
+      assert.equal(error.details.current.token, error.details.currentToken);
+      return true;
+    },
+  );
   assert.equal(writes, 0);
 });
 
@@ -405,7 +468,6 @@ test("time list returns a canonical observation with exact date coverage", async
   assert.equal(observation.records[0].kind, "time-entry");
   assert.equal(observation.records[0].id, "9");
   assert.equal(observation.records[0].durationSeconds, 90);
-  assert.equal(observation.records[0].snapshotToken, undefined);
   assert.equal(context.get("time-entry:9"), observation.records[0]);
 });
 
@@ -436,7 +498,6 @@ test("timer status returns complete canonical active timers without display fiel
   assert.equal(observation.records[0].id, "901");
   assert.equal(observation.records[0].state, "running");
   assert.equal(observation.records[0].elapsed, undefined);
-  assert.equal(observation.records[0].snapshotToken, undefined);
   assert.equal(context.get("active-timer:901"), observation.records[0]);
 });
 

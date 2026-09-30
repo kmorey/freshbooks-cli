@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   CONTRACT_VERSION,
   TrackingContext,
+  assertGuard,
   canonicalActiveTimers,
   canonicalDeleted,
   canonicalTimerSegment,
@@ -300,4 +301,29 @@ test("tracking context reuses a remembered canonical record by scope", () => {
     },
     records: [record],
   });
+});
+
+test("deleted current state returns a canonical deleted marker in the guard rejection", () => {
+  const current = canonicalDeleted("time-entry", 9);
+
+  assert.throws(
+    () => assertGuard("stale", current),
+    (error) => {
+      assert.equal(error.code, "GUARD_REJECTED");
+      assert.deepEqual(error.details, {
+        contractVersion: 2,
+        identity: { kind: "time-entry", id: "9" },
+        expectedToken: "stale",
+        currentToken: null,
+        current: {
+          contractVersion: 2,
+          kind: "time-entry",
+          id: "9",
+          exists: false,
+          token: null,
+        },
+      });
+      return true;
+    },
+  );
 });

@@ -156,6 +156,20 @@ export function semanticEqual(left, right) {
   return stableJson(semanticData(left)) === stableJson(semanticData(right));
 }
 
+export function assertGuard(expectedToken, current) {
+  if (expectedToken === undefined || expectedToken === current.token) return;
+  throw new CliError("The FreshBooks record changed since it was loaded", {
+    code: "GUARD_REJECTED",
+    details: {
+      contractVersion: CONTRACT_VERSION,
+      identity: { kind: current.kind, id: current.id },
+      expectedToken,
+      currentToken: current.token,
+      current,
+    },
+  });
+}
+
 export function recordScope(record) {
   if (!record || typeof record.kind !== "string" || record.kind.length === 0) {
     throw new CliError("Canonical record scope requires a kind", {

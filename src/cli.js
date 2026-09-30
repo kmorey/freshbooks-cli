@@ -246,7 +246,7 @@ async function diagnosticsCommand({ action, output, configStore, secretStore }) 
     localDate: todayInTimezone(config.timezone),
     capabilities: [
       "clients", "projects", "time-entries", "timer-segments", "timer-switch", "popup-onboarding",
-      "snapshot-guards", "local-calendar", "bounded-history",
+      "semantic-guards", "local-calendar", "bounded-history",
     ],
   };
   output.success(result, `freshbooks ${PACKAGE_VERSION}: ${result.authenticated ? "authenticated" : "not authenticated"}`);
@@ -295,26 +295,26 @@ async function timerCommand({ action, argument, options, output, service, bindTr
   }
   if (action === "log") {
     service = await bindTracking();
-    const entry = await service.logTimer(timerId, { snapshotToken: options.snapshot });
+    const entry = await service.logTimer(timerId, { guard: options.guard });
     output.success(entry, `Logged ${entry.elapsed} to FreshBooks (#${entry.id}).`);
     return 0;
   }
   if (action === "pause") {
     service = await bindTracking();
-    const timer = await service.pauseTimer(timerId, { snapshotToken: options.snapshot });
+    const timer = await service.pauseTimer(timerId, { guard: options.guard });
     output.success(timer, `Paused FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "resume") {
     service = await bindTracking();
-    const timer = await service.resumeTimer(timerId, { snapshotToken: options.snapshot });
+    const timer = await service.resumeTimer(timerId, { guard: options.guard });
     output.success(timer, `Resumed FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "correct") {
     const duration = parseDuration(requireOption(options, "duration"));
     service = await bindTracking();
-    const timer = await service.correctTimer(timerId, duration, { snapshotToken: options.snapshot });
+    const timer = await service.correctTimer(timerId, duration, { guard: options.guard });
     output.success(timer, `Corrected FreshBooks timer #${timer.id} to ${timer.elapsed}.`);
     return 0;
   }
@@ -323,7 +323,7 @@ async function timerCommand({ action, argument, options, output, service, bindTr
       throw new CliError("Provide --note to update a timer", { exitCode: 2 });
     }
     service = await bindTracking();
-    const timer = await service.updateTimer(timerId, { note: options.note }, { snapshotToken: options.snapshot });
+    const timer = await service.updateTimer(timerId, { note: options.note }, { guard: options.guard });
     output.success(timer, `Updated FreshBooks timer #${timer.id}.`);
     return 0;
   }
@@ -335,7 +335,7 @@ async function timerCommand({ action, argument, options, output, service, bindTr
       note: options.note,
     };
     service = await bindTracking();
-    const result = await service.switchTimer(timerId, fields, { snapshotToken: options.snapshot });
+    const result = await service.switchTimer(timerId, fields, { guard: options.guard });
     output.success(result, `Switched to FreshBooks timer #${result.timer.id}.`);
     return 0;
   }
@@ -347,7 +347,7 @@ async function timerCommand({ action, argument, options, output, service, bindTr
       });
     }
     service = await bindTracking();
-    const result = await service.discardTimer(timerId);
+    const result = await service.discardTimer(timerId, { guard: options.guard });
     output.success(result, `Discarded FreshBooks timer #${result.id}.`);
     return 0;
   }
@@ -431,7 +431,7 @@ async function timeCommand({ action, argument, options, output, service, bindTra
       throw new CliError("Provide at least one field to update", { exitCode: 2 });
     }
     service = await bindTracking();
-    const entry = await service.updateTimeEntry(entryId, patch, { snapshotToken: options.snapshot });
+    const entry = await service.updateTimeEntry(entryId, patch, { guard: options.guard });
     output.success(entry, `Updated FreshBooks time entry #${entry.id}.`);
     return 0;
   }
@@ -444,7 +444,7 @@ async function timeCommand({ action, argument, options, output, service, bindTra
       });
     }
     service = await bindTracking();
-    const result = await service.deleteTimeEntry(entryId, { snapshotToken: options.snapshot });
+    const result = await service.deleteTimeEntry(entryId, { guard: options.guard });
     output.success(result, `Deleted FreshBooks time entry #${entryId}.`);
     return 0;
   }
@@ -527,17 +527,17 @@ Usage:
   freshbooks diagnostics status
   freshbooks timer status
   freshbooks timer start --project ID --service ID [--note TEXT]
-  freshbooks timer pause [--id TIMER_ID]
-  freshbooks timer resume [--id TIMER_ID]
-  freshbooks timer correct --duration SECONDS [--id TIMER_ID]
-  freshbooks timer update --note TEXT [--id TIMER_ID]
-  freshbooks timer log [--id TIMER_ID]
-  freshbooks timer switch --project ID --service ID [--id TIMER_ID]
-  freshbooks timer discard [--id TIMER_ID] --yes
+  freshbooks timer pause [--id TIMER_ID] [--guard TOKEN]
+  freshbooks timer resume [--id TIMER_ID] [--guard TOKEN]
+  freshbooks timer correct --duration SECONDS [--id TIMER_ID] [--guard TOKEN]
+  freshbooks timer update --note TEXT [--id TIMER_ID] [--guard TOKEN]
+  freshbooks timer log [--id TIMER_ID] [--guard TOKEN]
+  freshbooks timer switch --project ID --service ID [--id TIMER_ID] [--guard TOKEN]
+  freshbooks timer discard [--id TIMER_ID] [--guard TOKEN] --yes
   freshbooks time list [--from DATE] [--to DATE] [--project ID] [--limit COUNT]
   freshbooks time add --duration 1h30m [--date YYYY-MM-DD] [--project ID] [--note TEXT]
-  freshbooks time update ENTRY_ID [--date YYYY-MM-DD] [--duration 45m] [--note TEXT]
-  freshbooks time delete ENTRY_ID --snapshot TOKEN --yes
+  freshbooks time update ENTRY_ID [--date YYYY-MM-DD] [--duration 45m] [--note TEXT] [--guard TOKEN]
+  freshbooks time delete ENTRY_ID --guard TOKEN --yes
 
 Options:
   --json       Emit one stable JSON object for Quickshell and scripts

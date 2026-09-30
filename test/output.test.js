@@ -29,6 +29,42 @@ test("JSON errors carry a machine-readable code", () => {
   });
 });
 
+test("JSON output preserves all guard rejection detail fields", () => {
+  const stdout = sink();
+  const stderr = sink();
+  const output = new Output({ json: true, stdout, stderr });
+  const current = {
+    contractVersion: 2,
+    kind: "time-entry",
+    id: "9",
+    exists: false,
+    token: null,
+  };
+  const details = {
+    contractVersion: 2,
+    identity: { kind: "time-entry", id: "9" },
+    expectedToken: "stale",
+    currentToken: null,
+    current,
+  };
+
+  output.error(new CliError("The FreshBooks record changed since it was loaded", {
+    code: "GUARD_REJECTED",
+    details,
+  }));
+
+  assert.deepEqual(JSON.parse(stderr.value), {
+    schemaVersion: 1,
+    ok: false,
+    error: {
+      code: "GUARD_REJECTED",
+      message: "The FreshBooks record changed since it was loaded",
+      details,
+    },
+  });
+  assert.equal(stdout.value, "");
+});
+
 test("diagnostics status is non-interactive and bounded", async () => {
   const stdout = sink();
   const stderr = sink();
@@ -47,7 +83,7 @@ test("diagnostics status is non-interactive and bounded", async () => {
   assert.equal(result.authenticated, true);
   assert.equal(result.businessSelected, true);
   assert.equal(result.timezone, "America/Chicago");
-  assert.ok(result.capabilities.includes("snapshot-guards"));
+  assert.ok(result.capabilities.includes("semantic-guards"));
   assert.ok(result.capabilities.includes("popup-onboarding"));
   assert.equal(stderr.value, "");
 });

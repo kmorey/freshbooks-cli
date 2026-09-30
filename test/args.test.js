@@ -30,3 +30,10 @@ test("parseArgs recognizes secret and authorization code stdin flags", () => {
 test("parseArgs recognizes the version flag without a command", () => {
   assert.equal(parseArgs(["--version"]).options.version, true);
 });
+
+test("parseArgs exposes the semantic guard option", () => {
+  assert.deepEqual(parseArgs(["time", "delete", "9", "--guard", "stale", "--yes"]), {
+    positionals: ["time", "delete", "9"],
+    options: { guard: "stale", yes: true },
+  });
+});

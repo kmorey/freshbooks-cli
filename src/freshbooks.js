@@ -1,7 +1,11 @@
-import { createHash } from "node:crypto";
 import { CliError } from "./errors.js";
 import { elapsedSeconds, formatDuration } from "./format.js";
-import { canonicalActiveTimers, canonicalTimeEntry } from "./tracking.js";
+import {
+  assertGuard,
+  canonicalActiveTimers,
+  canonicalDeleted,
+  canonicalTimeEntry,
+} from "./tracking.js";
 
 export class FreshBooksService {
   constructor({ client, configStore, now = () => new Date(), trackingContext = null }) {
@@ -229,9 +233,8 @@ export class FreshBooksService {
     return presentTimeEntry(payload?.time_entry || payload, { timezone });
   }
 
-  async updateTimeEntry(entryId, patch, { snapshotToken } = {}) {
-    const existing = await this.timeEntry(entryId);
-    assertSnapshot(snapshotToken, entrySnapshot(existing), presentTimeEntry(existing));
+  async updateTimeEntry(entryId, patch, { guard } = {}) {
+    const existing = await this.guardedTimeEntry(entryId, guard);
     if (patch.project_id !== undefined || patch.service_id !== undefined) {
       const projectId = patch.project_id ?? existing.project_id;
       const serviceId = patch.service_id ?? existing.service_id;
@@ -257,9 +260,8 @@ export class FreshBooksService {
     return presentTimeEntry(payload?.time_entry || payload, { timezone });
   }
 
-  async deleteTimeEntry(entryId, { snapshotToken } = {}) {
-    const existing = await this.timeEntry(entryId);
-    assertSnapshot(snapshotToken, entrySnapshot(existing), presentTimeEntry(existing));
+  async deleteTimeEntry(entryId, { guard } = {}) {
+    const existing = await this.guardedTimeEntry(entryId, guard);
     const businessId = await this.businessId();
     await this.client.request(`/timetracking/business/${businessId}/time_entries/${entryId}`, {
       method: "DELETE",
@@ -443,9 +445,8 @@ export class FreshBooksService {
     return this.requireRefreshedTimer(created.timer.id);
   }
 
-  async pauseTimer(timerId, { snapshotToken } = {}) {
-    const timer = await this.activeTimer(timerId);
-    assertSnapshot(snapshotToken, timer.snapshotToken, publicTimer(timer));
+  async pauseTimer(timerId, { guard } = {}) {
+    const timer = await this.guardedActiveTimer(timerId, guard);
     if (!timer.running || !timer._openSegment) return timer;
     const duration = Math.max(
       0,
@@ -455,9 +456,8 @@ export class FreshBooksService {
     return this.requireRefreshedTimer(timer.id);
   }
 
-  async resumeTimer(timerId, { snapshotToken } = {}) {
-    const timer = await this.activeTimer(timerId);
-    assertSnapshot(snapshotToken, timer.snapshotToken, publicTimer(timer));
+  async resumeTimer(timerId, { guard } = {}) {
+    const timer = await this.guardedActiveTimer(timerId, guard);
     if (timer.running) return timer;
     const template = timer._segments.at(-1);
     const businessId = await this.businessId();
@@ -478,9 +478,8 @@ export class FreshBooksService {
     return this.requireRefreshedTimer(timer.id);
   }
 
-  async correctTimer(timerId, targetSeconds, { snapshotToken } = {}) {
-    const timer = await this.activeTimer(timerId);
-    assertSnapshot(snapshotToken, timer.snapshotToken, publicTimer(timer));
+  async correctTimer(timerId, targetSeconds, { guard } = {}) {
+    const timer = await this.guardedActiveTimer(timerId, guard);
     if (!Number.isSafeInteger(targetSeconds) || targetSeconds < 0) {
       throw new CliError("Timer duration must be whole non-negative seconds", {
         code: "INVALID_DURATION",
@@ -519,17 +518,19 @@ export class FreshBooksService {
     return this.requireRefreshedTimer(timer.id);
   }
 
-  async updateTimer(timerId, patch, { snapshotToken } = {}) {
-    const timer = await this.activeTimer(timerId);
-    assertSnapshot(snapshotToken, timer.snapshotToken, publicTimer(timer));
+  async updateTimer(timerId, patch, { guard } = {}) {
+    const timer = await this.guardedActiveTimer(timerId, guard);
     for (const segment of timer._segments) await this.updateTimerSegment(segment, patch);
     return this.requireRefreshedTimer(timer.id);
   }
 
-  async logTimer(timerId, { snapshotToken } = {}) {
-    let timer = await this.activeTimer(timerId);
-    assertSnapshot(snapshotToken, timer.snapshotToken, publicTimer(timer));
-    if (timer.running) timer = await this.pauseTimer(timer.id, { snapshotToken: timer.snapshotToken });
+  async logTimer(timerId, { guard } = {}) {
+    let timer = await this.guardedActiveTimer(timerId, guard);
+    if (timer.running) {
+      timer = await this.pauseTimer(timer.id, {
+        guard: this.currentTimerRecord(timer).token,
+      });
+    }
     const { project, abilities } = await this.timerProject(timer.projectId);
     const selectedService = selectProjectService(project, timer.serviceId);
     assertTrackableProject(project, selectedService, abilities);
@@ -548,7 +549,7 @@ export class FreshBooksService {
     };
   }
 
-  async switchTimer(timerId, fields, { snapshotToken } = {}) {
+  async switchTimer(timerId, fields, { guard } = {}) {
     if (!fields.project_id) {
       throw new CliError("Switching a timer requires a target project", {
         code: "PROJECT_REQUIRED",
@@ -560,7 +561,7 @@ export class FreshBooksService {
     assertTrackableProject(project, service, abilities);
     let logged = null;
     const timers = await this.activeTimers();
-    if (timers.length > 0) logged = await this.logTimer(timerId, { snapshotToken });
+    if (timers.length > 0) logged = await this.logTimer(timerId, { guard });
     try {
       const timer = await this.startTimer(fields);
       return { logged, timer, partial: false };
@@ -575,8 +576,8 @@ export class FreshBooksService {
     }
   }
 
-  async discardTimer(timerId) {
-    const timer = await this.activeTimer(timerId);
+  async discardTimer(timerId, { guard } = {}) {
+    const timer = await this.guardedActiveTimer(timerId, guard);
     for (const segment of timer._segments) await this.deleteTimeEntry(segment.id);
     return { id: timer.id, segmentIds: timer.activeSegmentIds, deleted: true };
   }
@@ -600,6 +601,50 @@ export class FreshBooksService {
     }
     return timer;
   }
+  async guardedTimeEntry(entryId, guard) {
+    let existing;
+    try {
+      existing = await this.timeEntry(entryId);
+    } catch (error) {
+      if (guard !== undefined && error?.status === 404) {
+        assertGuard(guard, canonicalDeleted("time-entry", entryId));
+      }
+      throw error;
+    }
+    if (guard !== undefined) {
+      const context = this.requireTracking();
+      const current = context.remember(canonicalTimeEntry(existing, {
+        timezone: context.timezone,
+      }));
+      assertGuard(guard, current);
+    }
+    return existing;
+  }
+
+  async guardedActiveTimer(timerId, guard) {
+    let timer;
+    try {
+      timer = await this.activeTimer(timerId);
+    } catch (error) {
+      if (guard !== undefined && timerId !== undefined && error?.code === "TIMER_NOT_ACTIVE") {
+        assertGuard(guard, canonicalDeleted("active-timer", timerId));
+      }
+      throw error;
+    }
+    if (guard !== undefined) assertGuard(guard, this.currentTimerRecord(timer));
+    return timer;
+  }
+
+  currentTimerRecord(timer) {
+    const current = this.requireTracking().get(`active-timer:${String(timer.id)}`);
+    if (!current) {
+      throw new CliError("Canonical active timer is required", {
+        code: "TRACKING_CONTEXT_REQUIRED",
+      });
+    }
+    return current;
+  }
+
   requireTracking() {
     if (!this.trackingContext) {
       throw new CliError("Canonical tracking context is required", {
@@ -712,7 +757,6 @@ export function groupTimerSegments(entries, now = new Date()) {
       serviceId: current?.service_id,
       note: current?.note,
       billable: current?.billable,
-      snapshotToken: logicalTimerSnapshot(segments),
     };
     Object.defineProperties(timer, {
       _segments: { value: activeSegments },
@@ -817,7 +861,6 @@ export function presentTimeEntry(entry, { timezone = Intl.DateTimeFormat().resol
     note: entry.note || "",
     billable: entry.billable === true,
     billed: entry.billed === true,
-    snapshotToken: entrySnapshot(entry),
   };
 }
 
@@ -830,44 +873,4 @@ function dateInTimezone(timestamp, timezone) {
     year: "numeric", month: "2-digit", day: "2-digit",
   }).formatToParts(date).map((part) => [part.type, part.value]));
   return `${parts.year}-${parts.month}-${parts.day}`;
-}
-
-function logicalTimerSnapshot(segments) {
-  return digest(segments.map(snapshotEntryFields));
-}
-
-function entrySnapshot(entry) {
-  return digest(snapshotEntryFields(entry));
-}
-
-function snapshotEntryFields(entry) {
-  return {
-    id: entry?.id,
-    is_logged: entry?.is_logged,
-    duration: entry?.duration,
-    started_at: entry?.started_at,
-    local_started_at: entry?.local_started_at,
-    note: entry?.note,
-    project_id: entry?.project_id,
-    client_id: entry?.client_id,
-    service_id: entry?.service_id,
-    billable: entry?.billable,
-    timer_id: entry?.timer?.id,
-  };
-}
-
-function digest(value) {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
-
-function assertSnapshot(expected, actual, authoritative) {
-  if (!expected || expected === actual) return;
-  throw new CliError("The FreshBooks record changed since it was loaded", {
-    code: "REMOTE_CHANGED",
-    details: { authoritative },
-  });
-}
-
-function publicTimer(timer) {
-  return Object.fromEntries(Object.entries(timer).filter(([key]) => !key.startsWith("_")));
 }
