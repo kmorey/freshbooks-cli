@@ -416,8 +416,8 @@ async function timeCommand({ action, argument, options, output, service, bindTra
       billable: options.billable,
     };
     service = await bindTracking();
-    const entry = await service.createTimeEntry(fields);
-    output.success(entry, `Created FreshBooks time entry #${entry.id}.`);
+    const result = await service.createTimeEntry(fields);
+    output.success(result, `Created FreshBooks time entry #${result.results[0].id}.`);
     return 0;
   }
   if (action === "update") {
@@ -439,8 +439,8 @@ async function timeCommand({ action, argument, options, output, service, bindTra
     }
     const guard = requireOption(options, "guard");
     service = await bindTracking();
-    const entry = await service.updateTimeEntry(entryId, patch, { guard });
-    output.success(entry, `Updated FreshBooks time entry #${entry.id}.`);
+    const result = await service.updateTimeEntry(entryId, patch, { guard });
+    output.success(result, `Updated FreshBooks time entry #${result.results[0].id}.`);
     return 0;
   }
   if (action === "delete") {

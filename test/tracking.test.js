@@ -8,6 +8,7 @@ import {
   canonicalDeleted,
   canonicalTimerSegment,
   canonicalTimeEntry,
+  receipt,
   recordScope,
   semanticEqual,
   semanticToken,
@@ -124,6 +125,24 @@ test("list detail and mutation shapes have identical semantics", () => {
   assert.equal(detail.token, mutation.token);
   assert.ok(semanticEqual(list, detail));
   assert.ok(semanticEqual(detail, mutation));
+});
+
+test("time entry create receipt marks assigned identity absent before", () => {
+  const created = canonicalTimeEntry(rawEntry(), { timezone });
+  const result = receipt("time-entry-create", [{
+    scope: recordScope(created),
+    before: { absent: true },
+    after: { record: created },
+  }], [created]);
+
+  assert.equal(result.mutationKind, "time-entry-create");
+  assert.deepEqual(result.changes, [{
+    scope: "time-entry:9",
+    before: { absent: true },
+    after: { record: created },
+  }]);
+  assert.deepEqual(result.results, [created]);
+  assert.equal(result.kind, undefined);
 });
 
 test("normalizes NFC without trimming notes", () => {

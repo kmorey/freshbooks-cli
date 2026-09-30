@@ -37,6 +37,16 @@ export class TrackingContext {
   }
 }
 
+export function receipt(mutationKind, changes, results, phase = null) {
+  return {
+    contractVersion: CONTRACT_VERSION,
+    mutationKind,
+    changes,
+    results,
+    phase,
+  };
+}
+
 export function canonicalTimeEntry(payload, { timezone } = {}) {
   const raw = unwrapTimeEntry(payload);
   const startedAt = canonicalInstant(value(raw, "started_at", "startedAt"));

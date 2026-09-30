@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { FreshBooksService, groupTimerSegments, presentTimeEntry } from "../src/freshbooks.js";
-import { TrackingContext } from "../src/tracking.js";
+import { TrackingContext, canonicalTimeEntry } from "../src/tracking.js";
 import { run } from "../src/cli.js";
 
 const businessId = 123;
@@ -240,6 +240,46 @@ test("guard rejection returns complete canonical current state without writing",
   assert.equal(writes, 0);
 });
 
+test("update receipt carries before and after tokens", async () => {
+  let reads = 0;
+  const beforePayload = {
+    id: 9,
+    is_logged: true,
+    duration: 60,
+    started_at: "2026-09-02T12:00:00Z",
+    project_id: 44,
+    client_id: 55,
+    service_id: 66,
+    note: "Before",
+    billable: true,
+    billed: false,
+  };
+  const client = { async request(path, options = {}) {
+    if (path.endsWith("/time_entries/9") && !options.method) {
+      reads += 1;
+      return { time_entry: beforePayload };
+    }
+    if (path.endsWith("/time_entries/9") && options.method === "PUT") {
+      return { time_entry: { ...beforePayload, ...options.body.time_entry, note: "After" } };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const context = trackingContext();
+  const before = canonicalTimeEntry(beforePayload, { timezone: context.timezone });
+  const service = new FreshBooksService({ client, configStore }).withTracking(context);
+
+  const result = await service.updateTimeEntry(9, { note: "After" }, { guard: before.token });
+
+  assert.equal(reads, 1);
+  assert.equal(result.mutationKind, "time-entry-update");
+  assert.equal(result.kind, undefined);
+  assert.equal(result.changes[0].scope, "time-entry:9");
+  assert.deepEqual(result.changes[0].before, { token: before.token });
+  assert.equal(result.changes[0].after.record.note, "After");
+  assert.notEqual(result.changes[0].after.record.token, before.token);
+  assert.equal(result.results[0], result.changes[0].after.record);
+});
+
 test("logged entries derive client and billability from the selected project service", async () => {
   let written;
   const client = { async request(path, options = {}) {
@@ -260,9 +300,13 @@ test("logged entries derive client and billability from the selected project ser
   });
   assert.equal(written.client_id, 55);
   assert.equal(written.billable, true);
-  assert.equal(result.projectId, 44);
-  assert.equal(result.clientId, 55);
-  assert.equal(result.billable, true);
+  assert.equal(result.mutationKind, "time-entry-create");
+  assert.equal(result.kind, undefined);
+  assert.equal(result.changes[0].scope, "time-entry:9");
+  assert.deepEqual(result.changes[0].before, { absent: true });
+  assert.equal(result.results[0].projectId, "44");
+  assert.equal(result.results[0].clientId, "55");
+  assert.equal(result.results[0].billable, true);
 });
 
 test("internal project time remains non-billable even when its service is billable", async () => {

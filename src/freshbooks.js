@@ -5,6 +5,8 @@ import {
   canonicalActiveTimers,
   canonicalDeleted,
   canonicalTimeEntry,
+  receipt,
+  recordScope,
 } from "./tracking.js";
 
 export class FreshBooksService {
@@ -229,12 +231,19 @@ export class FreshBooksService {
       method: "POST",
       body: { time_entry: compact(entry) },
     });
-    const timezone = (await this.configStore.read()).timezone;
-    return presentTimeEntry(payload?.time_entry || payload, { timezone });
+    const context = this.trackingContext;
+    const timezone = context?.timezone ?? (await this.configStore.read()).timezone;
+    const created = canonicalTimeEntry(payload, { timezone });
+    context?.remember(created);
+    return receipt("time-entry-create", [{
+      scope: recordScope(created),
+      before: { absent: true },
+      after: { record: created },
+    }], [created]);
   }
 
   async updateTimeEntry(entryId, patch, { guard } = {}) {
-    const existing = await this.guardedTimeEntry(entryId, guard);
+    const { existing, current: before } = await this.guardedTimeEntry(entryId, guard);
     if (patch.project_id !== undefined || patch.service_id !== undefined) {
       const projectId = patch.project_id ?? existing.project_id;
       const serviceId = patch.service_id ?? existing.service_id;
@@ -256,13 +265,26 @@ export class FreshBooksService {
       `/timetracking/business/${businessId}/time_entries/${entryId}`,
       { method: "PUT", body: { time_entry: entry } },
     );
-    const timezone = (await this.configStore.read()).timezone;
-    return presentTimeEntry(payload?.time_entry || payload, { timezone });
+    const context = this.requireTracking();
+    const updated = context.remember(canonicalTimeEntry(payload, {
+      timezone: context.timezone,
+    }));
+    return receipt("time-entry-update", [{
+      scope: recordScope(updated),
+      before: { token: before.token },
+      after: { record: updated },
+    }], [updated]);
   }
 
   async deleteTimeEntry(entryId, { guard } = {}) {
-    await this.guardedTimeEntry(entryId, guard);
-    return this.deleteTimeEntryRecord(entryId);
+    const { current: before } = await this.guardedTimeEntry(entryId, guard);
+    await this.deleteTimeEntryRecord(entryId);
+    const deleted = this.requireTracking().remember(canonicalDeleted("time-entry", entryId));
+    return receipt("time-entry-delete", [{
+      scope: recordScope(deleted),
+      before: { token: before.token },
+      after: { deleted: true },
+    }], [deleted]);
   }
 
   async deleteTimeEntryRecord(entryId) {
@@ -620,7 +642,7 @@ export class FreshBooksService {
       timezone: context.timezone,
     }));
     assertGuard(guard, current);
-    return existing;
+    return { existing, current };
   }
 
   async guardedActiveTimer(timerId, guard) {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { Output } from "../src/output.js";
 import { CliError } from "../src/errors.js";
 import { run } from "../src/cli.js";
+import { canonicalTimeEntry } from "../src/tracking.js";
 
 function sink() {
   return { value: "", write(chunk) { this.value += chunk; } };
@@ -136,6 +137,63 @@ test("disappeared guarded timer returns canonical deleted details without writin
   });
   assert.equal(writes, 0);
   assert.equal(stdout.value, "");
+});
+
+test("delete receipt carries deleted marker", async () => {
+  const stdout = sink();
+  const stderr = sink();
+  let reads = 0;
+  let writes = 0;
+  const currentPayload = {
+    id: 9,
+    is_logged: true,
+    started_at: "2026-09-02T12:00:00Z",
+    duration: 60,
+    note: "Before",
+  };
+  const current = canonicalTimeEntry(currentPayload, { timezone: "America/Chicago" });
+  const configStore = { async read() {
+    return { businessId: 123, timezone: "America/Chicago" };
+  } };
+  const client = { async request(path, options = {}) {
+    if (path.endsWith("/time_entries/9") && !options.method) {
+      reads += 1;
+      return { time_entry: currentPayload };
+    }
+    if (path.endsWith("/time_entries/9") && options.method === "DELETE") {
+      writes += 1;
+      return {};
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+
+  assert.equal(await run([
+    "time", "delete", "9", "--yes", "--guard", current.token, "--json",
+  ], {
+    stdout,
+    stderr,
+    configStore,
+    client,
+  }), 0);
+
+  const result = JSON.parse(stdout.value).data;
+  assert.equal(result.mutationKind, "time-entry-delete");
+  assert.equal(result.kind, undefined);
+  assert.deepEqual(result.changes, [{
+    scope: "time-entry:9",
+    before: { token: current.token },
+    after: { deleted: true },
+  }]);
+  assert.deepEqual(result.results, [{
+    contractVersion: 2,
+    kind: "time-entry",
+    id: "9",
+    exists: false,
+    token: null,
+  }]);
+  assert.equal(reads, 1);
+  assert.equal(writes, 1);
+  assert.equal(stderr.value, "");
 });
 
 test("diagnostics status is non-interactive and bounded", async () => {
