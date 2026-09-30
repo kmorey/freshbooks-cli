@@ -5,7 +5,7 @@ export const CONTRACT_VERSION = 2;
 
 const OMIT = Symbol("omit");
 
-export function canonicalTimeEntry(payload, { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone } = {}) {
+export function canonicalTimeEntry(payload, { timezone } = {}) {
   const raw = unwrapTimeEntry(payload);
   const startedAt = canonicalInstant(value(raw, "started_at", "startedAt"));
   const explicitLocalDate = value(raw, "local_date", "localDate");
@@ -135,6 +135,11 @@ function canonicalLocalDate(localValue, startedAt, timezone) {
     if (isDateKey(date)) return date;
     throw new CliError(`Invalid canonical local date: ${String(localValue)}`, {
       code: "INVALID_CANONICAL_DATE",
+    });
+  }
+  if (typeof timezone !== "string" || timezone.length === 0) {
+    throw new CliError(`Invalid canonical timezone: ${String(timezone)}`, {
+      code: "INVALID_CANONICAL_TIMEZONE",
     });
   }
   try {

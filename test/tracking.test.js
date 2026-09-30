@@ -72,6 +72,19 @@ test("canonicalizes identity and optional aliases", () => {
   assert.equal(recordScope(numeric), "time-entry:9");
 });
 
+test("requires an explicit valid timezone when deriving localDate", () => {
+  const withoutLocalDate = rawEntry({ local_started_at: null });
+
+  assert.throws(
+    () => canonicalTimeEntry(withoutLocalDate),
+    { code: "INVALID_CANONICAL_TIMEZONE" },
+  );
+  assert.throws(
+    () => canonicalTimeEntry(withoutLocalDate, { timezone: "Not/A_Real_Timezone" }),
+    { code: "INVALID_CANONICAL_TIMEZONE" },
+  );
+});
+
 test("rejects unsafe identities", () => {
   for (const id of [undefined, null, "", "   ", Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
     assert.throws(
