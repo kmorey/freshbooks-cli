@@ -412,7 +412,7 @@ test("time list returns a canonical observation with exact date coverage", async
 test("timer status returns complete canonical active timers without display fields", async () => {
   const client = { async request(path) {
     if (path === "/timetracking/business/123/time_entries") {
-      return { time_entries: [segment()], meta: { pages: 500 } };
+      return { time_entries: [segment()], meta: { pages: 1 } };
     }
     throw new Error(`Unexpected request: ${path}`);
   } };
@@ -495,4 +495,105 @@ test("run creates command-scoped contexts for canonical read output", async () =
   assert.equal(timerData.contractVersion, 2);
   assert.equal(timerData.queryKey, "timer-status");
   assert.equal(timerData.records[0].id, "901");
+});
+
+test("timer status reads later pages before claiming complete coverage", async () => {
+  const pages = [];
+  const client = { async request(path, options = {}) {
+    if (path !== "/timetracking/business/123/time_entries") {
+      throw new Error(`Unexpected request: ${path}`);
+    }
+    pages.push(options.query.page);
+    return options.query.page === 1
+      ? { time_entries: [], meta: { pages: 2 } }
+      : { time_entries: [segment()], meta: { pages: 2 } };
+  } };
+  const context = new TrackingContext({
+    timezone: "America/Chicago",
+    observedAt: "2026-09-01T15:00:00Z",
+  });
+  const service = new FreshBooksService({ client, configStore, now }).withTracking(context);
+
+  const observation = await service.timerStatusObservation();
+
+  assert.deepEqual(pages, [1, 2]);
+  assert.equal(observation.coverage.complete, true);
+  assert.equal(observation.records[0].id, "901");
+});
+
+test("overlapping runs keep independent tracking contexts on one injected service", async () => {
+  const pending = [];
+  const started = [];
+  const client = { request() {
+    return new Promise((resolve) => {
+      pending.push(resolve);
+      started.shift()?.();
+    });
+  } };
+  const serviceConfig = {
+    async read() { return { businessId, timezone: "UTC" }; },
+  };
+  const service = new FreshBooksService({ client, configStore: serviceConfig, now });
+  const firstStarted = new Promise((resolve) => started.push(resolve));
+  const firstStdout = sink();
+  const firstRun = run(["time", "list", "--json"], {
+    service,
+    configStore: { async read() { return { timezone: "America/Chicago" }; } },
+    secretStore: {},
+    now,
+    stdout: firstStdout,
+    stderr: sink(),
+  });
+  await firstStarted;
+
+  const secondStarted = new Promise((resolve) => started.push(resolve));
+  const secondStdout = sink();
+  const secondRun = run(["time", "list", "--json"], {
+    service,
+    configStore: { async read() { return { timezone: "UTC" }; } },
+    secretStore: {},
+    now,
+    stdout: secondStdout,
+    stderr: sink(),
+  });
+  await secondStarted;
+
+  const response = {
+    time_entries: [{
+      id: 9,
+      is_logged: true,
+      started_at: "2026-09-02T02:00:00Z",
+      duration: 90,
+    }],
+    meta: { pages: 1 },
+  };
+  pending[1](response);
+  assert.equal(await secondRun, 0);
+  pending[0](response);
+  assert.equal(await firstRun, 0);
+
+  assert.equal(JSON.parse(firstStdout.value).data.records[0].localDate, "2026-09-01");
+  assert.equal(JSON.parse(secondStdout.value).data.records[0].localDate, "2026-09-02");
+});
+
+test("local usage errors do not read configuration to create tracking context", async () => {
+  let configReads = 0;
+  const stdout = sink();
+  const stderr = sink();
+
+  assert.equal(await run(["time", "delete", "--json"], {
+    service: new FreshBooksService({ client: {}, configStore }),
+    configStore: {
+      async read() {
+        configReads += 1;
+        throw new Error("configuration should not be read");
+      },
+    },
+    secretStore: {},
+    stdout,
+    stderr,
+  }), 2);
+
+  assert.equal(configReads, 0);
+  assert.match(JSON.parse(stderr.value).error.message, /Usage: freshbooks time delete/);
 });

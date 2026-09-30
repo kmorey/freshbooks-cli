@@ -41,14 +41,14 @@ export async function run(argv, dependencies = {}) {
     const client =
       dependencies.client ||
       new FreshBooksClient({ configStore, secretStore, fetcher: dependencies.fetcher });
-    let service =
+    const service =
       dependencies.service || new FreshBooksService({ client, configStore, now: dependencies.now });
     const [group, action, argument] = parsed.positionals;
-    if (group === "timer" || group === "time") {
+    const bindTracking = async () => {
       const { timezone } = await configStore.read();
       const observedAt = dependencies.now ? dependencies.now() : new Date();
-      service = service.withTracking(new TrackingContext({ timezone, observedAt }));
-    }
+      return service.withTracking(new TrackingContext({ timezone, observedAt }));
+    };
 
     if (group === "auth") {
       return await authCommand({ action, options: parsed.options, output, configStore, secretStore, dependencies });
@@ -66,10 +66,14 @@ export async function run(argv, dependencies = {}) {
       return await diagnosticsCommand({ action, output, configStore, secretStore });
     }
     if (group === "timer") {
-      return await timerCommand({ action, argument, options: parsed.options, output, service });
+      return await timerCommand({
+        action, argument, options: parsed.options, output, service, bindTracking,
+      });
     }
     if (group === "time") {
-      return await timeCommand({ action, argument, options: parsed.options, output, service });
+      return await timeCommand({
+        action, argument, options: parsed.options, output, service, bindTracking,
+      });
     }
 
     throw new CliError(`Unknown command: ${parsed.positionals.join(" ")}`, {
@@ -249,9 +253,10 @@ async function diagnosticsCommand({ action, output, configStore, secretStore }) 
   return 0;
 }
 
-async function timerCommand({ action, argument, options, output, service }) {
+async function timerCommand({ action, argument, options, output, service, bindTracking }) {
   const timerId = optionalInteger(argument ?? options.id, "id");
   if (action === "status") {
+    service = await bindTracking();
     const observation = await service.timerStatusObservation();
     const timers = observation.records;
     output.success(
@@ -269,37 +274,40 @@ async function timerCommand({ action, argument, options, output, service }) {
   }
   if (action === "start") {
     const startedAt = parseDate(options.startedAt, "started-at");
-    const timer = await service.startTimer(
-      {
-        project_id: optionalInteger(options.project, "project"),
-        client_id: optionalInteger(options.client, "client"),
-        service_id: optionalInteger(options.service, "service"),
-        note: options.note,
-        billable: options.billable,
-        started_at: startedAt?.toISOString(),
-      },
-      { force: options.force },
-    );
+    const fields = {
+      project_id: optionalInteger(options.project, "project"),
+      client_id: optionalInteger(options.client, "client"),
+      service_id: optionalInteger(options.service, "service"),
+      note: options.note,
+      billable: options.billable,
+      started_at: startedAt?.toISOString(),
+    };
+    service = await bindTracking();
+    const timer = await service.startTimer(fields, { force: options.force });
     output.success(timer, `Started FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "log") {
+    service = await bindTracking();
     const entry = await service.logTimer(timerId, { snapshotToken: options.snapshot });
     output.success(entry, `Logged ${entry.elapsed} to FreshBooks (#${entry.id}).`);
     return 0;
   }
   if (action === "pause") {
+    service = await bindTracking();
     const timer = await service.pauseTimer(timerId, { snapshotToken: options.snapshot });
     output.success(timer, `Paused FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "resume") {
+    service = await bindTracking();
     const timer = await service.resumeTimer(timerId, { snapshotToken: options.snapshot });
     output.success(timer, `Resumed FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "correct") {
     const duration = parseDuration(requireOption(options, "duration"));
+    service = await bindTracking();
     const timer = await service.correctTimer(timerId, duration, { snapshotToken: options.snapshot });
     output.success(timer, `Corrected FreshBooks timer #${timer.id} to ${timer.elapsed}.`);
     return 0;
@@ -308,17 +316,20 @@ async function timerCommand({ action, argument, options, output, service }) {
     if (options.note === undefined) {
       throw new CliError("Provide --note to update a timer", { exitCode: 2 });
     }
+    service = await bindTracking();
     const timer = await service.updateTimer(timerId, { note: options.note }, { snapshotToken: options.snapshot });
     output.success(timer, `Updated FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "switch") {
-    const result = await service.switchTimer(timerId, {
+    const fields = {
       project_id: optionalInteger(options.project, "project"),
       client_id: optionalInteger(options.client, "client"),
       service_id: optionalInteger(options.service, "service"),
       note: options.note,
-    }, { snapshotToken: options.snapshot });
+    };
+    service = await bindTracking();
+    const result = await service.switchTimer(timerId, fields, { snapshotToken: options.snapshot });
     output.success(result, `Switched to FreshBooks timer #${result.timer.id}.`);
     return 0;
   }
@@ -329,6 +340,7 @@ async function timerCommand({ action, argument, options, output, service }) {
         exitCode: 2,
       });
     }
+    service = await bindTracking();
     const result = await service.discardTimer(timerId);
     output.success(result, `Discarded FreshBooks timer #${result.id}.`);
     return 0;
@@ -336,7 +348,7 @@ async function timerCommand({ action, argument, options, output, service }) {
   throw unknownAction("timer", action);
 }
 
-async function timeCommand({ action, argument, options, output, service }) {
+async function timeCommand({ action, argument, options, output, service, bindTracking }) {
   const entryId = optionalInteger(argument, "entry-id");
   if (action === "list") {
     const from = options.from === undefined
@@ -350,10 +362,12 @@ async function timeCommand({ action, argument, options, output, service }) {
           ? await service.localRangeBoundary(options.to, { endOfDay: true })
           : parseRangeDate(options.to, "to", { endOfDay: true }));
     const limit = optionalInteger(options.limit, "limit");
+    const projectId = optionalInteger(options.project, "project");
+    service = await bindTracking();
     const observation = await service.timeEntryObservation({
       started_from: from?.toISOString(),
       started_to: to?.toISOString(),
-      project_id: optionalInteger(options.project, "project"),
+      project_id: projectId,
       include_unlogged: options.includeUnlogged,
       ...(limit ? { sort: "started_at_desc", per_page: Math.min(100, limit) } : {}),
     }, {
@@ -376,7 +390,7 @@ async function timeCommand({ action, argument, options, output, service }) {
     const duration = parseDuration(requireOption(options, "duration"));
     const localDateFields = options.date ? await service.localDateFields(options.date) : {};
     const startedAt = parseDate(options.startedAt || localDateFields.started_at || new Date().toISOString(), "started-at");
-    const entry = await service.createTimeEntry({
+    const fields = {
       is_logged: true,
       duration,
       started_at: startedAt.toISOString(),
@@ -387,7 +401,9 @@ async function timeCommand({ action, argument, options, output, service }) {
       service_id: optionalInteger(options.service, "service"),
       note: options.note,
       billable: options.billable,
-    });
+    };
+    service = await bindTracking();
+    const entry = await service.createTimeEntry(fields);
     output.success(entry, `Created FreshBooks time entry #${entry.id}.`);
     return 0;
   }
@@ -408,6 +424,7 @@ async function timeCommand({ action, argument, options, output, service }) {
     if (Object.values(patch).every((value) => value === undefined)) {
       throw new CliError("Provide at least one field to update", { exitCode: 2 });
     }
+    service = await bindTracking();
     const entry = await service.updateTimeEntry(entryId, patch, { snapshotToken: options.snapshot });
     output.success(entry, `Updated FreshBooks time entry #${entry.id}.`);
     return 0;
@@ -420,6 +437,7 @@ async function timeCommand({ action, argument, options, output, service }) {
         exitCode: 2,
       });
     }
+    service = await bindTracking();
     const result = await service.deleteTimeEntry(entryId, { snapshotToken: options.snapshot });
     output.success(result, `Deleted FreshBooks time entry #${entryId}.`);
     return 0;

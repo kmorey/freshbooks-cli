@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { CliError } from "./errors.js";
 import { elapsedSeconds, formatDuration } from "./format.js";
-import { canonicalActiveTimers, canonicalTimeEntry, recordScope } from "./tracking.js";
+import { canonicalActiveTimers, canonicalTimeEntry } from "./tracking.js";
 
 export class FreshBooksService {
   constructor({ client, configStore, now = () => new Date(), trackingContext = null }) {
@@ -12,8 +12,8 @@ export class FreshBooksService {
   }
 
   withTracking(context) {
-    this.trackingContext = context;
-    return this;
+    const bound = Object.create(Object.getPrototypeOf(this));
+    return Object.assign(bound, this, { trackingContext: context });
   }
 
   async identity() {
@@ -323,8 +323,11 @@ export class FreshBooksService {
   }
 
   async timerStatusObservation() {
-    const timers = await this.activeTimers();
     const context = this.requireTracking();
+    const entries = await this.timerCandidates({ complete: true });
+    const records = canonicalActiveTimers(entries, {
+      observedAt: context.observedAt,
+    });
     return context.observe({
       queryKey: "timer-status",
       coverage: {
@@ -333,10 +336,7 @@ export class FreshBooksService {
         fromDate: null,
         toDate: null,
       },
-      records: timers.map((timer) => context.get(recordScope({
-        kind: "active-timer",
-        id: timer.id,
-      }))),
+      records,
     });
   }
 
@@ -361,18 +361,27 @@ export class FreshBooksService {
     return active[0];
   }
 
-  async timerCandidates() {
+  async timerCandidates({ complete = false } = {}) {
     const businessId = await this.businessId();
     // include_unlogged adds running/paused entries to the ordinary time-entry
     // result set and FreshBooks scopes the list to the authenticated user by
-    // default. Timer polling must stay bounded instead of traversing the
-    // account's complete history on every status check. Do not add an
-    // identity_id filter: FreshBooks rejects that combination with HTTP 422.
-    const payload = await this.client.request(
-      `/timetracking/business/${businessId}/time_entries`,
-      { query: { include_unlogged: true, per_page: 100, page: 1 } },
-    );
-    return payload?.time_entries || [];
+    // default. Mutation discovery stays bounded to page 1, while canonical
+    // status reads traverse all reported pages before claiming completeness.
+    // Do not add an identity_id filter: FreshBooks rejects that combination
+    // with HTTP 422.
+    const entries = [];
+    let page = 1;
+    let pages = 1;
+    do {
+      const payload = await this.client.request(
+        `/timetracking/business/${businessId}/time_entries`,
+        { query: { include_unlogged: true, per_page: 100, page } },
+      );
+      entries.push(...(payload?.time_entries || []));
+      pages = complete ? Number(payload?.meta?.pages || 1) : 1;
+      page += 1;
+    } while (page <= pages);
+    return entries;
   }
 
   async startTimer(fields, { force = false } = {}) {
