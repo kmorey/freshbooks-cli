@@ -191,6 +191,49 @@ test("aggregates equal-start segments in stable identity order", () => {
   assert.equal(forward.segments[1].durationSeconds, null);
 });
 
+test("running timer metadata comes from the current open segment", () => {
+  const open = rawSegment({
+    id: "10",
+    duration: null,
+    project_id: 44,
+    client_id: 55,
+    service_id: 66,
+    note: "Current work",
+    billable: true,
+    timer: { id: 901, is_running: true },
+  });
+  const paused = rawSegment({
+    id: "2",
+    duration: 57,
+    project_id: 45,
+    client_id: 56,
+    service_id: 67,
+    note: "Stale work",
+    billable: false,
+  });
+
+  const timer = canonicalActiveTimers(
+    [paused, open],
+    { observedAt: "2026-09-01T15:00:00Z" },
+  )[0];
+
+  assert.deepEqual(timer.segments.map((segment) => segment.id), ["10", "2"]);
+  assert.equal(timer.state, "running");
+  assert.deepEqual({
+    projectId: timer.projectId,
+    clientId: timer.clientId,
+    serviceId: timer.serviceId,
+    note: timer.note,
+    billable: timer.billable,
+  }, {
+    projectId: "44",
+    clientId: "55",
+    serviceId: "66",
+    note: "Current work",
+    billable: true,
+  });
+});
+
 test("wall clock observation changes no timer token", () => {
   const segments = [rawSegment({
     id: "2",

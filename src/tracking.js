@@ -70,9 +70,10 @@ export function canonicalActiveTimers(rawSegments, { observedAt } = {}) {
       return left.id < right.id ? -1 : 1;
     });
     const activeSegments = group.filter(({ segment }) => !segment.logged);
-    const source = activeSegments.at(-1).raw;
+    const openEntry = activeSegments.filter(({ segment }) => segment.running).at(-1) || null;
+    const source = (openEntry || activeSegments.at(-1)).raw;
     const segments = group.map(({ segment }) => segment);
-    const openSegment = activeSegments.filter(({ segment }) => segment.running).at(-1)?.segment || null;
+    const openSegment = openEntry?.segment || null;
     const record = {
       contractVersion: CONTRACT_VERSION,
       kind: "active-timer",
