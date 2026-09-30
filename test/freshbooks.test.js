@@ -613,7 +613,7 @@ test("timer start reports missing project before reading tracking configuration"
     secretStore: {},
     stdout: sink(),
     stderr,
-  }), 1);
+  }), 2);
 
   assert.equal(configReads, 0);
   assert.deepEqual(JSON.parse(stderr.value).error, {

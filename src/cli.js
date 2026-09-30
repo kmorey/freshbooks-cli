@@ -285,6 +285,7 @@ async function timerCommand({ action, argument, options, output, service, bindTr
     if (!fields.project_id) {
       throw new CliError("Starting a timer requires a project", {
         code: "PROJECT_REQUIRED",
+        exitCode: 2,
       });
     }
     service = await bindTracking();
