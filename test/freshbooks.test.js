@@ -240,6 +240,57 @@ test("guard rejection returns complete canonical current state without writing",
   assert.equal(writes, 0);
 });
 
+test("time entry create receipt marks assigned identity absent before", async () => {
+  const client = { async request(path, options = {}) {
+    if (path === "/timetracking/business/123/time_entries" && options.method === "POST") {
+      return { time_entry: { id: 9, ...options.body.time_entry } };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const context = trackingContext();
+  const service = new FreshBooksService({ client, configStore }).withTracking(context);
+
+  const result = await service.createTimeEntry({
+    identity_id: 88,
+    is_logged: true,
+    duration: 60,
+    started_at: "2026-09-02T12:00:00Z",
+    project_id: null,
+    client_id: null,
+    service_id: null,
+    note: "Created",
+    billable: false,
+    billed: false,
+  });
+  const created = canonicalTimeEntry({
+    id: 9,
+    is_logged: true,
+    identity_id: 88,
+    duration: 60,
+    started_at: "2026-09-02T12:00:00Z",
+    project_id: null,
+    client_id: null,
+    service_id: null,
+    note: "Created",
+    billable: false,
+    billed: false,
+  }, { timezone: context.timezone });
+
+  assert.deepEqual(result, {
+    contractVersion: 2,
+    mutationKind: "time-entry-create",
+    changes: [{
+      scope: "time-entry:9",
+      before: { absent: true },
+      after: { record: created },
+    }],
+    results: [created],
+    phase: null,
+  });
+  assert.equal(result.kind, undefined);
+  assert.equal(context.get("time-entry:9"), result.results[0]);
+});
+
 test("update receipt carries before and after tokens", async () => {
   let reads = 0;
   const beforePayload = {
