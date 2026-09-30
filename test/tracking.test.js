@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   CONTRACT_VERSION,
+  TrackingContext,
   canonicalActiveTimers,
   canonicalDeleted,
   canonicalTimerSegment,
@@ -268,4 +269,35 @@ test("timer field groups change semantics", () => {
     assert.notEqual(changed.token, base.token);
     assert.equal(semanticEqual(base, changed), false);
   }
+});
+
+test("tracking context reuses a remembered canonical record by scope", () => {
+  const context = new TrackingContext({
+    timezone,
+    observedAt: "2026-09-01T15:00:00Z",
+  });
+  const record = canonicalTimeEntry(rawEntry(), { timezone });
+
+  assert.equal(context.remember(record), record);
+  assert.equal(context.get("time-entry:9"), record);
+  assert.deepEqual(context.observe({
+    queryKey: "time-list",
+    coverage: {
+      complete: true,
+      includesDeleted: false,
+      fromDate: "2026-09-01",
+      toDate: "2026-09-30",
+    },
+    records: [record],
+  }), {
+    contractVersion: 2,
+    queryKey: "time-list",
+    coverage: {
+      complete: true,
+      includesDeleted: false,
+      fromDate: "2026-09-01",
+      toDate: "2026-09-30",
+    },
+    records: [record],
+  });
 });

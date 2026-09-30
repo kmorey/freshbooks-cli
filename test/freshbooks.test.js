@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { FreshBooksService, groupTimerSegments, presentTimeEntry } from "../src/freshbooks.js";
+import { TrackingContext } from "../src/tracking.js";
+import { run } from "../src/cli.js";
 
 const businessId = 123;
 const now = () => new Date("2026-09-01T15:00:00Z");
@@ -15,6 +17,10 @@ function segment(overrides = {}) {
     timer: { id: 901, is_running: true }, client_id: 55, project_id: 44, service_id: 66,
     ...overrides,
   };
+}
+
+function sink() {
+  return { value: "", write(chunk) { this.value += chunk; } };
 }
 
 test("groups timer segments by timer identity and ignores bare unlogged entries", () => {
@@ -359,4 +365,134 @@ test("timer switch validates the target before logging current work", async () =
   const service = new FreshBooksService({ client, configStore, now });
   await assert.rejects(service.switchTimer(901, { project_id: 99, service_id: 77 }), { code: "PROJECT_NOT_ACTIVE" });
   assert.equal(timerWrites, 0);
+});
+
+test("time list returns a canonical observation with exact date coverage", async () => {
+  const client = { async request(path) {
+    if (path === "/timetracking/business/123/time_entries") {
+      return {
+        time_entries: [{
+          id: 9,
+          is_logged: true,
+          started_at: "2026-09-02T12:00:00Z",
+          duration: 90,
+          project_id: 44,
+          note: "Work",
+        }],
+        meta: { pages: 1 },
+      };
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  } };
+  const context = new TrackingContext({
+    timezone: "America/Chicago",
+    observedAt: "2026-09-02T12:01:30Z",
+  });
+  const service = new FreshBooksService({ client, configStore }).withTracking(context);
+
+  const observation = await service.timeEntryObservation(
+    { started_from: "2026-09-01T05:00:00.000Z", started_to: "2026-10-01T04:59:59.999Z" },
+    { coverage: { complete: true, fromDate: "2026-09-01", toDate: "2026-09-30" } },
+  );
+
+  assert.equal(observation.contractVersion, 2);
+  assert.deepEqual(observation.coverage, {
+    complete: true,
+    includesDeleted: false,
+    fromDate: "2026-09-01",
+    toDate: "2026-09-30",
+  });
+  assert.equal(observation.records[0].kind, "time-entry");
+  assert.equal(observation.records[0].id, "9");
+  assert.equal(observation.records[0].durationSeconds, 90);
+  assert.equal(observation.records[0].snapshotToken, undefined);
+  assert.equal(context.get("time-entry:9"), observation.records[0]);
+});
+
+test("timer status returns complete canonical active timers without display fields", async () => {
+  const client = { async request(path) {
+    if (path === "/timetracking/business/123/time_entries") {
+      return { time_entries: [segment()], meta: { pages: 500 } };
+    }
+    throw new Error(`Unexpected request: ${path}`);
+  } };
+  const context = new TrackingContext({
+    timezone: "America/Chicago",
+    observedAt: "2026-09-01T15:00:00Z",
+  });
+  const service = new FreshBooksService({ client, configStore, now }).withTracking(context);
+
+  const observation = await service.timerStatusObservation();
+
+  assert.equal(observation.contractVersion, 2);
+  assert.equal(observation.queryKey, "timer-status");
+  assert.deepEqual(observation.coverage, {
+    complete: true,
+    includesDeleted: false,
+    fromDate: null,
+    toDate: null,
+  });
+  assert.equal(observation.records[0].kind, "active-timer");
+  assert.equal(observation.records[0].id, "901");
+  assert.equal(observation.records[0].state, "running");
+  assert.equal(observation.records[0].elapsed, undefined);
+  assert.equal(observation.records[0].snapshotToken, undefined);
+  assert.equal(context.get("active-timer:901"), observation.records[0]);
+});
+
+test("run creates command-scoped contexts for canonical read output", async () => {
+  const client = { async request(path, options = {}) {
+    if (path !== "/timetracking/business/123/time_entries") {
+      throw new Error(`Unexpected request: ${path}`);
+    }
+    if (options.query.include_unlogged === true) {
+      return { time_entries: [segment()] };
+    }
+    return {
+      time_entries: [{
+        id: 9,
+        is_logged: true,
+        started_at: "2026-09-02T12:00:00Z",
+        duration: 90,
+        note: "Work",
+      }],
+      meta: { pages: 1 },
+    };
+  } };
+  const secretStore = {};
+  const timeStdout = sink();
+  const timerStdout = sink();
+
+  assert.equal(await run([
+    "time", "list", "--from", "2026-09-01", "--to", "2026-09-30", "--json",
+  ], {
+    client,
+    configStore,
+    secretStore,
+    now,
+    stdout: timeStdout,
+    stderr: sink(),
+  }), 0);
+  assert.equal(await run(["timer", "status", "--json"], {
+    client,
+    configStore,
+    secretStore,
+    now,
+    stdout: timerStdout,
+    stderr: sink(),
+  }), 0);
+
+  const timeData = JSON.parse(timeStdout.value).data;
+  const timerData = JSON.parse(timerStdout.value).data;
+  assert.equal(timeData.contractVersion, 2);
+  assert.deepEqual(timeData.coverage, {
+    complete: true,
+    includesDeleted: false,
+    fromDate: "2026-09-01",
+    toDate: "2026-09-30",
+  });
+  assert.equal(timeData.records[0].id, "9");
+  assert.equal(timerData.contractVersion, 2);
+  assert.equal(timerData.queryKey, "timer-status");
+  assert.equal(timerData.records[0].id, "901");
 });

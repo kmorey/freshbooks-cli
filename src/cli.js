@@ -8,9 +8,10 @@ import { FreshBooksClient } from "./api.js";
 import { FreshBooksService } from "./freshbooks.js";
 import { authorizationUrl, exchangeAuthorizationCode } from "./auth.js";
 import { Output } from "./output.js";
-import { parseDate, parseDuration, parseRangeDate } from "./format.js";
+import { formatDuration, parseDate, parseDuration, parseRangeDate } from "./format.js";
 import { CliError } from "./errors.js";
 import { runProcess } from "./process.js";
+import { TrackingContext } from "./tracking.js";
 
 const require = createRequire(import.meta.url);
 const { version: PACKAGE_VERSION } = require("../package.json");
@@ -40,9 +41,14 @@ export async function run(argv, dependencies = {}) {
     const client =
       dependencies.client ||
       new FreshBooksClient({ configStore, secretStore, fetcher: dependencies.fetcher });
-    const service =
+    let service =
       dependencies.service || new FreshBooksService({ client, configStore, now: dependencies.now });
     const [group, action, argument] = parsed.positionals;
+    if (group === "timer" || group === "time") {
+      const { timezone } = await configStore.read();
+      const observedAt = dependencies.now ? dependencies.now() : new Date();
+      service = service.withTracking(new TrackingContext({ timezone, observedAt }));
+    }
 
     if (group === "auth") {
       return await authCommand({ action, options: parsed.options, output, configStore, secretStore, dependencies });
@@ -246,14 +252,15 @@ async function diagnosticsCommand({ action, output, configStore, secretStore }) 
 async function timerCommand({ action, argument, options, output, service }) {
   const timerId = optionalInteger(argument ?? options.id, "id");
   if (action === "status") {
-    const timers = await service.activeTimers();
+    const observation = await service.timerStatusObservation();
+    const timers = observation.records;
     output.success(
-      { active: timers.length > 0, timers },
+      observation,
       timers.length
         ? timers
             .map(
               (timer) =>
-                `${timer.running ? "running" : "paused"}\t${timer.elapsed}\t${timer.note || "No note"} (#${timer.id})`,
+                `${timer.state}\t${formatDuration(canonicalTimerElapsed(timer))}\t${timer.note || "No note"} (#${timer.id})`,
             )
             .join("\n")
         : "No FreshBooks timer is active.",
@@ -343,16 +350,23 @@ async function timeCommand({ action, argument, options, output, service }) {
           ? await service.localRangeBoundary(options.to, { endOfDay: true })
           : parseRangeDate(options.to, "to", { endOfDay: true }));
     const limit = optionalInteger(options.limit, "limit");
-    const entries = await service.timeEntryRecords({
+    const observation = await service.timeEntryObservation({
       started_from: from?.toISOString(),
       started_to: to?.toISOString(),
       project_id: optionalInteger(options.project, "project"),
       include_unlogged: options.includeUnlogged,
       ...(limit ? { sort: "started_at_desc", per_page: Math.min(100, limit) } : {}),
-    }, { limit });
+    }, {
+      limit,
+      coverage: {
+        complete: !limit,
+        fromDate: options.from ?? null,
+        toDate: options.to ?? null,
+      },
+    });
     output.success(
-      entries,
-      entries
+      observation,
+      observation.records
         .map((entry) => `${entry.id}\t${entry.durationSeconds}s\t${entry.note || ""}`)
         .join("\n") || "No time entries found.",
     );
@@ -411,6 +425,19 @@ async function timeCommand({ action, argument, options, output, service }) {
     return 0;
   }
   throw unknownAction("time", action);
+}
+
+function canonicalTimerElapsed(timer) {
+  const runningSeconds = timer.elapsedAnchor.runningStartedAt == null
+    ? 0
+    : Math.max(
+        0,
+        Math.floor(
+          (new Date(timer.elapsedAnchor.observedAt).getTime()
+            - new Date(timer.elapsedAnchor.runningStartedAt).getTime()) / 1000,
+        ),
+      );
+  return timer.elapsedAnchor.closedSeconds + runningSeconds;
 }
 
 function unknownAction(group, action) {

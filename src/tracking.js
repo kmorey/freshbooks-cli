@@ -5,6 +5,38 @@ export const CONTRACT_VERSION = 2;
 
 const OMIT = Symbol("omit");
 
+export class TrackingContext {
+  constructor({ timezone, observedAt }) {
+    this.timezone = timezone;
+    this.observedAt = canonicalInstant(observedAt);
+    this.records = new Map();
+  }
+
+  remember(record) {
+    this.records.set(recordScope(record), record);
+    return record;
+  }
+
+  get(scope) {
+    return this.records.get(scope);
+  }
+
+  observe({ queryKey, coverage, records }) {
+    const canonicalRecords = records.map((record) => this.remember(record));
+    return {
+      contractVersion: CONTRACT_VERSION,
+      queryKey,
+      coverage: {
+        complete: coverage.complete === true,
+        includesDeleted: coverage.includesDeleted === true,
+        fromDate: coverage.fromDate ?? null,
+        toDate: coverage.toDate ?? null,
+      },
+      records: canonicalRecords,
+    };
+  }
+}
+
 export function canonicalTimeEntry(payload, { timezone } = {}) {
   const raw = unwrapTimeEntry(payload);
   const startedAt = canonicalInstant(value(raw, "started_at", "startedAt"));

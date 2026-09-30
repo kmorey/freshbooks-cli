@@ -1,12 +1,19 @@
+import { createHash } from "node:crypto";
 import { CliError } from "./errors.js";
 import { elapsedSeconds, formatDuration } from "./format.js";
-import { createHash } from "node:crypto";
+import { canonicalActiveTimers, canonicalTimeEntry, recordScope } from "./tracking.js";
 
 export class FreshBooksService {
-  constructor({ client, configStore, now = () => new Date() }) {
+  constructor({ client, configStore, now = () => new Date(), trackingContext = null }) {
     this.client = client;
     this.configStore = configStore;
     this.now = now;
+    this.trackingContext = trackingContext;
+  }
+
+  withTracking(context) {
+    this.trackingContext = context;
+    return this;
   }
 
   async identity() {
@@ -173,10 +180,29 @@ export class FreshBooksService {
   }
 
   async timeEntryRecords(filters = {}, options = {}) {
-    const timezone = (await this.configStore.read()).timezone;
-    return (await this.listTimeEntries(filters, options))
-      .filter((entry) => entry.is_logged === true)
-      .map((entry) => presentTimeEntry(entry, { timezone }));
+    const entries = (await this.listTimeEntries(filters, options))
+      .filter((entry) => entry.is_logged === true);
+    if (!this.trackingContext) {
+      const timezone = (await this.configStore.read()).timezone;
+      return entries.map((entry) => presentTimeEntry(entry, { timezone }));
+    }
+    return entries.map((entry) => this.trackingContext.remember(
+      canonicalTimeEntry(entry, { timezone: this.trackingContext.timezone }),
+    ));
+  }
+
+  async timeEntryObservation(filters = {}, { coverage, ...options } = {}) {
+    const records = await this.timeEntryRecords(filters, options);
+    return this.requireTracking().observe({
+      queryKey: "time-list",
+      coverage: {
+        complete: coverage?.complete === true,
+        includesDeleted: false,
+        fromDate: coverage?.fromDate ?? null,
+        toDate: coverage?.toDate ?? null,
+      },
+      records,
+    });
   }
 
   async createTimeEntry(fields) {
@@ -286,7 +312,32 @@ export class FreshBooksService {
 
   async activeTimers() {
     const entries = await this.timerCandidates();
+    if (this.trackingContext) {
+      for (const record of canonicalActiveTimers(entries, {
+        observedAt: this.trackingContext.observedAt,
+      })) {
+        this.trackingContext.remember(record);
+      }
+    }
     return groupTimerSegments(entries, this.now());
+  }
+
+  async timerStatusObservation() {
+    const timers = await this.activeTimers();
+    const context = this.requireTracking();
+    return context.observe({
+      queryKey: "timer-status",
+      coverage: {
+        complete: true,
+        includesDeleted: false,
+        fromDate: null,
+        toDate: null,
+      },
+      records: timers.map((timer) => context.get(recordScope({
+        kind: "active-timer",
+        id: timer.id,
+      }))),
+    });
   }
 
   async activeTimer(timerId) {
@@ -540,6 +591,15 @@ export class FreshBooksService {
     }
     return timer;
   }
+  requireTracking() {
+    if (!this.trackingContext) {
+      throw new CliError("Canonical tracking context is required", {
+        code: "TRACKING_CONTEXT_REQUIRED",
+      });
+    }
+    return this.trackingContext;
+  }
+
 }
 
 export function writableTimeEntry(entry) {
