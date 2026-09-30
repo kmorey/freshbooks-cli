@@ -28,6 +28,77 @@ export function canonicalTimeEntry(payload, { timezone } = {}) {
   return { ...record, token: semanticToken(record) };
 }
 
+export function canonicalTimerSegment(payload) {
+  const raw = unwrapTimeEntry(payload);
+  const duration = value(raw, "duration", "duration_seconds", "durationSeconds");
+  const durationSeconds = duration == null ? null : canonicalDuration(duration);
+  const logged = canonicalBoolean(value(raw, "is_logged", "logged"));
+  const record = {
+    contractVersion: CONTRACT_VERSION,
+    kind: "timer-segment",
+    id: canonicalId(raw?.id),
+    timerId: canonicalId(value(raw?.timer, "id") ?? value(raw, "timer_id", "timerId")),
+    exists: true,
+    startedAt: canonicalInstant(value(raw, "started_at", "startedAt")),
+    durationSeconds,
+    running: !logged && durationSeconds === null,
+    logged,
+  };
+  return { ...record, token: semanticToken(record) };
+}
+
+export function canonicalActiveTimers(rawSegments, { observedAt } = {}) {
+  const canonicalObservedAt = canonicalInstant(observedAt);
+  const groups = new Map();
+
+  for (const payload of rawSegments) {
+    const raw = unwrapTimeEntry(payload);
+    const timerIdentity = value(raw?.timer, "id") ?? value(raw, "timer_id", "timerId");
+    if (timerIdentity == null) continue;
+    const segment = canonicalTimerSegment(raw);
+    const group = groups.get(segment.timerId) || [];
+    group.push({ raw, segment });
+    groups.set(segment.timerId, group);
+  }
+
+  const timers = [];
+  for (const [id, group] of groups) {
+    if (!group.some(({ segment }) => !segment.logged)) continue;
+    group.sort(({ segment: left }, { segment: right }) => {
+      if (left.startedAt !== right.startedAt) return left.startedAt < right.startedAt ? -1 : 1;
+      if (left.id === right.id) return 0;
+      return left.id < right.id ? -1 : 1;
+    });
+    const activeSegments = group.filter(({ segment }) => !segment.logged);
+    const source = activeSegments.at(-1).raw;
+    const segments = group.map(({ segment }) => segment);
+    const openSegment = activeSegments.filter(({ segment }) => segment.running).at(-1)?.segment || null;
+    const record = {
+      contractVersion: CONTRACT_VERSION,
+      kind: "active-timer",
+      id,
+      exists: true,
+      segments,
+      state: openSegment ? "running" : "paused",
+      elapsedAnchor: {
+        closedSeconds: segments.reduce(
+          (total, segment) => total + (segment.durationSeconds ?? 0),
+          0,
+        ),
+        runningStartedAt: openSegment?.startedAt ?? null,
+        observedAt: canonicalObservedAt,
+      },
+      projectId: canonicalOptionalId(value(source, "project_id", "projectId")),
+      clientId: canonicalOptionalId(value(source, "client_id", "clientId")),
+      serviceId: canonicalOptionalId(value(source, "service_id", "serviceId")),
+      note: canonicalText(source?.note),
+      billable: canonicalBoolean(source?.billable),
+    };
+    timers.push({ ...record, token: semanticToken(record) });
+  }
+  return timers.sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+}
+
 export function canonicalDeleted(kind, id) {
   if (kind !== "time-entry" && kind !== "active-timer") {
     throw new CliError(`Invalid canonical record kind: ${String(kind)}`, {

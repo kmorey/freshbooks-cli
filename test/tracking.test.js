@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   CONTRACT_VERSION,
+  canonicalActiveTimers,
   canonicalDeleted,
+  canonicalTimerSegment,
   canonicalTimeEntry,
   recordScope,
   semanticEqual,
@@ -23,6 +25,22 @@ function rawEntry(overrides = {}) {
     note: "Work",
     billable: true,
     billed: false,
+    ...overrides,
+  };
+}
+
+function rawSegment(overrides = {}) {
+  return {
+    id: 10,
+    is_logged: false,
+    started_at: "2026-09-01T14:00:00.000Z",
+    duration: 57,
+    project_id: 44,
+    client_id: 55,
+    service_id: 66,
+    note: "Build shell plugin",
+    billable: true,
+    timer: { id: 901, is_running: false },
     ...overrides,
   };
 }
@@ -128,4 +146,83 @@ test("each Time Entry field group changes the token", () => {
   }
   assert.equal(canonicalDeleted("time-entry", 9).token, null);
   assert.equal(semanticToken(canonicalDeleted("time-entry", 9)), null);
+});
+
+test("list and timer aggregation representations have identical semantics", () => {
+  const listSegment = rawSegment();
+  const timerSegment = {
+    id: "10",
+    logged: false,
+    startedAt: "2026-09-01T14:00:00Z",
+    durationSeconds: 57,
+    projectId: "44",
+    clientId: "55",
+    serviceId: "66",
+    note: "Build shell plugin",
+    billable: true,
+    timerId: "901",
+    running: false,
+  };
+
+  assert.ok(semanticEqual(
+    canonicalTimerSegment(listSegment),
+    canonicalTimerSegment({ time_entry: timerSegment }),
+  ));
+  assert.ok(semanticEqual(
+    canonicalActiveTimers([listSegment], { observedAt: "2026-09-01T15:00:00Z" })[0],
+    canonicalActiveTimers([timerSegment], { observedAt: "2026-09-01T15:00:00.000Z" })[0],
+  ));
+});
+
+test("aggregates equal-start segments in stable identity order", () => {
+  const segments = [
+    rawSegment({ id: "2", duration: null, timer: { id: 901, is_running: true } }),
+    rawSegment({ id: "10", is_logged: true, duration: 57 }),
+  ];
+  const options = { observedAt: "2026-09-01T15:00:00Z" };
+  const forward = canonicalActiveTimers(segments, options)[0];
+  const reverse = canonicalActiveTimers([...segments].reverse(), options)[0];
+
+  assert.deepEqual(forward.segments.map((segment) => segment.id), ["10", "2"]);
+  assert.equal(forward.token, reverse.token);
+  assert.equal(forward.state, "running");
+  assert.equal(forward.elapsedAnchor.closedSeconds, 57);
+  assert.equal(forward.elapsedAnchor.runningStartedAt, "2026-09-01T14:00:00.000Z");
+  assert.equal(forward.segments[1].durationSeconds, null);
+});
+
+test("wall clock observation changes no timer token", () => {
+  const segments = [rawSegment({
+    id: "2",
+    duration: null,
+    timer: { id: 901, is_running: true },
+  })];
+  const atThree = canonicalActiveTimers(segments, { observedAt: "2026-09-01T15:00:00Z" })[0];
+  const atThreeOhOne = canonicalActiveTimers(segments, { observedAt: "2026-09-01T15:01:00Z" })[0];
+
+  assert.notEqual(atThree.elapsedAnchor.observedAt, atThreeOhOne.elapsedAnchor.observedAt);
+  assert.equal(atThree.token, atThreeOhOne.token);
+  assert.ok(semanticEqual(atThree, atThreeOhOne));
+  assert.notEqual(
+    semanticToken({ exists: true, observedAt: atThree.elapsedAnchor.observedAt }),
+    semanticToken({ exists: true, observedAt: atThreeOhOne.elapsedAnchor.observedAt }),
+  );
+});
+
+test("timer field groups change semantics", () => {
+  const options = { observedAt: "2026-09-01T15:00:00Z" };
+  const timer = (overrides = {}) => canonicalActiveTimers([rawSegment(overrides)], options)[0];
+  const base = timer();
+  const changes = [
+    timer({ note: "Other" }),
+    timer({ project_id: 45, service_id: 67 }),
+    timer({ billable: false }),
+    timer({ duration: null, timer: { id: 901, is_running: true } }),
+    timer({ started_at: "2026-09-01T14:01:00Z" }),
+  ];
+
+  for (const changed of changes) {
+    assert.notEqual(changed.token, base.token);
+    assert.equal(semanticEqual(base, changed), false);
+  }
 });
