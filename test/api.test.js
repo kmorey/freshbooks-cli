@@ -2,7 +2,17 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FreshBooksClient } from "../src/api.js";
+import { COMMAND_BUDGETS_MS, FreshBooksClient } from "../src/api.js";
+
+test("exports operation budgets for bounded request workflows", () => {
+  assert.deepEqual(COMMAND_BUDGETS_MS, {
+    read: 64_000,
+    singleWrite: 128_000,
+    multiSegment: 320_000,
+    log: 192_000,
+    switch: 320_000,
+  });
+});
 
 test("an unauthorized API call rotates the one-time refresh token and retries once", async () => {
   const requests = [];

@@ -79,67 +79,122 @@ If Secret Service cannot be reached—for example, from a terminal without an in
 freshbooks projects list
 freshbooks clients list
 freshbooks timer start --project 12345 --service 67890 --note 'Implement time widget'
-freshbooks timer status
-freshbooks timer pause
-freshbooks timer resume
-freshbooks timer correct --duration 1h30m
-freshbooks timer log
+freshbooks timer status --json
+freshbooks timer pause --id 456 --guard GUARD_TOKEN
+freshbooks timer resume --id 456 --guard GUARD_TOKEN
+freshbooks timer correct --id 456 --duration 1h30m --guard GUARD_TOKEN
+freshbooks timer log --id 456 --guard GUARD_TOKEN
 ```
 
-`timer status` groups Time Entries by timer identity and only exposes groups that still contain an unlogged segment. A pause closes the current unlogged segment; resume adds another segment to the same logical timer. When a logged entry is resumed, its duration is included in the displayed aggregate as `continuedSeconds`, while timer mutations remain limited to `activeSegmentIds`. `timer start` refuses to create another logical timer when one already exists. If multiple logical timers exist, pass `--id TIMER_ID` to mutations.
+`timer status` groups Time Entries by timer identity and only exposes groups that still contain an unlogged segment. A pause closes the current unlogged segment; resume adds another segment to the same logical timer. A canonical active timer includes all timer segments, including logged continuation predecessors, while writes remain limited to active segments. `timer start` refuses to create another logical timer when one already exists.
 
 Starting a timer derives client, internal, and billability fields from the selected project and service. Switching logs the current timer before starting the next one:
 
 ```bash
-freshbooks timer switch --id 456 --project 23456 --service 78901
+freshbooks timer switch --id 456 --guard GUARD_TOKEN --project 23456 --service 78901
 ```
 
-Discard is destructive and requires confirmation:
+Discard is destructive and requires both the current guard and explicit confirmation:
 
 ```bash
-freshbooks timer discard --id 456 --yes
+freshbooks timer discard --id 456 --guard GUARD_TOKEN --yes
 ```
 
 ## Time entries
 
 ```bash
-freshbooks time list --from 2026-09-01 --to 2026-09-02
+freshbooks time list --from 2026-09-01 --to 2026-09-02 --json
 freshbooks time add --date 2026-09-02 --duration 1h30m --project 12345 --service 67890 --note 'Planning'
-freshbooks time update 98765 --date 2026-09-03 --duration 1h45m --note 'Planning and review'
-freshbooks time delete 98765 --snapshot SNAPSHOT_TOKEN --yes
+freshbooks time update 98765 --guard GUARD_TOKEN --date 2026-09-03 --duration 1h45m --note 'Planning and review'
+freshbooks time delete 98765 --guard GUARD_TOKEN --yes
 ```
 
 Calendar dates use the configured FreshBooks timezone, including daylight-saving transitions. Set `FRESHBOOKS_TIMEZONE` to the account's IANA timezone (for example, `America/Chicago`) when it differs from the machine timezone. Entry create and project/service changes derive client, internal, and billability fields from the selected FreshBooks project service.
 
 ## Quickshell contract
 
-Add `--json` to any command. Exactly one JSON object is written to standard output on success:
+Add `--json` to any command. Exactly one JSON object is written to standard output on success. The envelope remains version 1; canonical tracking records and mutation receipts use contract version 2:
 
 ```json
 {
   "schemaVersion": 1,
   "ok": true,
   "data": {
-    "active": true,
-    "timers": [
+    "contractVersion": 2,
+    "queryKey": "timer-status",
+    "coverage": {
+      "complete": true,
+      "includesDeleted": false,
+      "fromDate": null,
+      "toDate": null
+    },
+    "records": [
       {
-        "id": 456,
-        "timerId": 456,
-        "segmentIds": [98764, 98765],
-        "activeSegmentIds": [98765],
-        "continuedSeconds": 1800,
-        "running": true,
-        "isLogged": false,
-        "startedAt": "2026-09-01T14:00:00Z",
-        "elapsedSeconds": 2525,
-        "elapsed": "42m 05s",
-        "projectId": 12345,
-        "note": "Implement time widget"
+        "contractVersion": 2,
+        "kind": "active-timer",
+        "id": "456",
+        "exists": true,
+        "segments": [
+          {
+            "contractVersion": 2,
+            "kind": "timer-segment",
+            "id": "98765",
+            "timerId": "456",
+            "exists": true,
+            "startedAt": "2026-09-01T14:00:00.000Z",
+            "durationSeconds": null,
+            "running": true,
+            "logged": false,
+            "token": "segment-semantic-token"
+          }
+        ],
+        "state": "running",
+        "elapsedAnchor": {
+          "closedSeconds": 1800,
+          "runningStartedAt": "2026-09-01T14:00:00.000Z",
+          "observedAt": "2026-09-01T14:12:05.000Z"
+        },
+        "projectId": "12345",
+        "clientId": "23456",
+        "serviceId": "67890",
+        "note": "Implement time widget",
+        "billable": true,
+        "token": "active-timer-semantic-token"
       }
     ]
   }
 }
 ```
+
+Canonical `time-entry` records use string `id`, `exists`, `localDate`, `startedAt`, `durationSeconds`, project/client/service IDs, note, billable/billed flags, and a semantic `token`. Canonical `active-timer` records use string `id`, canonical `segments`, `state`, `elapsedAnchor`, project/client/service IDs, note, billability, and a semantic `token`. Deleted records are `{ "contractVersion": 2, "kind": "...", "id": "...", "exists": false, "token": null }`.
+
+Every mutation of an existing time entry or timer requires `--guard TOKEN`, using the `token` from the canonical record the caller acted on. A stale token fails with `GUARD_REJECTED` and includes the complete current canonical record. Successful mutations return a version-2 receipt with:
+
+- `mutationKind`: the completed operation;
+- `changes`: scopes with the prior token or absence marker and the resulting record or deletion marker;
+- `results`: canonical records callers can apply immediately;
+- `phase`: `null` except for multi-phase operations.
+
+Timer switch receipts use `phase: { "log": "confirmed", "start": "confirmed" }`. If logging succeeds but starting fails, `TIMER_SWITCH_PARTIAL` includes `details.partialReceipt` with `phase: { "log": "confirmed", "start": "failed" }` plus `details.startError`. Callers must apply that partial receipt before presenting recovery.
+
+Successful mutations do not issue confirmation GETs. Their receipts are constructed from the guarded discovery record, confirmed write responses, and command-scoped tracking context. Poll explicitly when a later observation is needed.
+
+`freshbooks diagnostics status --json` advertises the release contract:
+
+```json
+{
+  "canonicalContractVersion": 2,
+  "commandBudgetsMs": {
+    "read": 64000,
+    "singleWrite": 128000,
+    "multiSegment": 320000,
+    "log": 192000,
+    "switch": 320000
+  }
+}
+```
+
+The diagnostics capability list includes `canonical-tracking-v2` and `mutation-receipts`. Treat the operation-aware budgets as maximum CLI coordination deadlines; they account for the 15-second network timeout, one authentication replay, bounded rate-limit waits, and each workflow's sequential request ceiling.
 
 Errors are written to standard error with a non-zero exit status:
 
@@ -156,8 +211,9 @@ Errors are written to standard error with a non-zero exit status:
 
 Recommended plugin behavior:
 
-- Poll `freshbooks timer status --json` every 15–30 seconds and immediately after actions.
-- Advance a running duration locally between polls instead of calling the API every second.
+- Poll `freshbooks timer status --json` every 15–30 seconds and immediately after actions that need a fresh observation.
+- Apply successful and partial mutation receipts before polling again.
+- Advance a running duration locally from `elapsedAnchor` instead of calling the API every second.
 - Treat `API_TIMEOUT` with `outcomeUnknown: true` as ambiguous and refresh before allowing another mutation.
 - For in-popup onboarding, pass the OAuth client secret with `auth configure --client-secret-stdin --json` and the returned authorization URL with `auth login --code-stdin --json`.
 - Open the URL returned by `auth url --json` in the user's browser; never render or log its state parameter.

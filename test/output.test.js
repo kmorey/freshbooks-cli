@@ -307,13 +307,23 @@ test("diagnostics status is non-interactive and bounded", async () => {
   const secretStore = { async read() { return { clientSecret: "present", accessToken: "present" }; } };
   assert.equal(await run(["diagnostics", "status", "--json"], { stdout, stderr, configStore, secretStore }), 0);
   const result = JSON.parse(stdout.value).data;
-  assert.equal(result.version, "0.2.0");
+  assert.equal(result.version, "0.3.0");
   assert.equal(result.configured, true);
   assert.equal(result.authenticated, true);
   assert.equal(result.businessSelected, true);
   assert.equal(result.timezone, "America/Chicago");
+  assert.equal(result.canonicalContractVersion, 2);
+  assert.deepEqual(result.commandBudgetsMs, {
+    read: 64_000,
+    singleWrite: 128_000,
+    multiSegment: 320_000,
+    log: 192_000,
+    switch: 320_000,
+  });
   assert.ok(result.capabilities.includes("semantic-guards"));
   assert.ok(result.capabilities.includes("popup-onboarding"));
+  assert.ok(result.capabilities.includes("canonical-tracking-v2"));
+  assert.ok(result.capabilities.includes("mutation-receipts"));
   assert.equal(stderr.value, "");
 });
 

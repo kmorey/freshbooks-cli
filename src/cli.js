@@ -4,7 +4,7 @@ import { stdin as defaultStdin, stdout as defaultStdout } from "node:process";
 import { parseArgs, optionalInteger, requireOption } from "./args.js";
 import { ConfigStore } from "./config.js";
 import { SecretStore } from "./secrets.js";
-import { FreshBooksClient } from "./api.js";
+import { COMMAND_BUDGETS_MS, FreshBooksClient } from "./api.js";
 import { FreshBooksService } from "./freshbooks.js";
 import { authorizationUrl, exchangeAuthorizationCode } from "./auth.js";
 import { Output } from "./output.js";
@@ -244,9 +244,12 @@ async function diagnosticsCommand({ action, output, configStore, secretStore }) 
     businessSelected: Boolean(config.businessId),
     timezone: config.timezone,
     localDate: todayInTimezone(config.timezone),
+    canonicalContractVersion: 2,
+    commandBudgetsMs: COMMAND_BUDGETS_MS,
     capabilities: [
       "clients", "projects", "time-entries", "timer-segments", "timer-switch", "popup-onboarding",
-      "semantic-guards", "local-calendar", "bounded-history",
+      "semantic-guards", "local-calendar", "bounded-history", "canonical-tracking-v2",
+      "mutation-receipts",
     ],
   };
   output.success(result, `freshbooks ${PACKAGE_VERSION}: ${result.authenticated ? "authenticated" : "not authenticated"}`);

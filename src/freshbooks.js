@@ -429,12 +429,22 @@ export class FreshBooksService {
         exitCode: 2,
       });
     }
-    const businessId = await this.businessId();
-    const identity = await this.identity();
-    const timezone = (await this.configStore.read()).timezone;
-    const { project, abilities } = await this.timerProject(fields.project_id);
+    const [identity, target, config] = await Promise.all([
+      this.identity(),
+      this.timerProject(fields.project_id),
+      this.configStore.read(),
+    ]);
+    return this.startTimerState(fields, {
+      identity,
+      ...target,
+      timezone: config.timezone,
+    });
+  }
+
+  async startTimerState(fields, { identity, project, abilities, timezone }) {
     const service = selectProjectService(project, fields.service_id);
     assertTrackableProject(project, service, abilities);
+    const businessId = await this.businessId();
     const startedAt = fields.started_at || this.now().toISOString();
     const common = timerEntryFields({
       ...fields,
@@ -464,11 +474,18 @@ export class FreshBooksService {
       identity_id: identity.id,
       timer: { id: created.timer.id },
     };
-    await this.client.request(
+    const assignedPayload = await this.client.request(
       `/comments/business/${businessId}/time_entries/${created.id}`,
       { method: "PUT", body: { time_entry: assigned } },
     );
-    const timer = await this.requireRefreshedTimer(created.timer.id);
+    const confirmed = {
+      ...created,
+      ...assigned,
+      ...(assignedPayload?.time_entry || assignedPayload),
+      id: created.id,
+      timer: { id: created.timer.id },
+    };
+    const timer = this.rememberTimerSegments([confirmed], created.timer.id);
     const result = this.currentTimerRecord(timer);
     return receipt("timer-start", [{
       scope: recordScope(result),
@@ -490,32 +507,32 @@ export class FreshBooksService {
       0,
       Math.floor((this.now().getTime() - new Date(timer._openSegment.started_at).getTime()) / 1000),
     );
-    await this.updateTimerSegment(timer._openSegment, { duration });
-    return this.requireRefreshedTimer(timer.id);
+    const updated = await this.updateTimerSegment(timer._openSegment, { duration });
+    return this.timerWithReplacements(timer, [updated]);
   }
 
   async resumeTimer(timerId, { guard } = {}) {
     const timer = await this.guardedActiveTimer(timerId, guard);
     const before = this.currentTimerRecord(timer);
-    if (!timer.running) {
-      const template = timer._segments.at(-1);
-      const businessId = await this.businessId();
-      await this.client.request(`/comments/business/${businessId}/time_entries`, {
-        method: "POST",
-        body: {
-          time_entry: timerEntryFields({
-            ...template,
-            id: undefined,
-            duration: null,
-            started_at: this.now().toISOString(),
-            local_started_at: null,
-            identity_id: null,
-            timer: { id: timer.id },
-          }),
-        },
-      });
-    }
-    const updated = timer.running ? timer : await this.requireRefreshedTimer(timer.id);
+    if (timer.running) return this.activeTimerReceipt("timer-resume", before, timer);
+    const template = timer._segments.at(-1);
+    const businessId = await this.businessId();
+    const payload = await this.client.request(`/comments/business/${businessId}/time_entries`, {
+      method: "POST",
+      body: {
+        time_entry: timerEntryFields({
+          ...template,
+          id: undefined,
+          duration: null,
+          started_at: this.now().toISOString(),
+          local_started_at: null,
+          identity_id: null,
+          timer: { id: timer.id },
+        }),
+      },
+    });
+    const created = payload?.time_entry || payload;
+    const updated = this.rememberTimerSegments([...this.timerSegments(timer), created], timer.id);
     return this.activeTimerReceipt("timer-resume", before, updated);
   }
 
@@ -532,6 +549,7 @@ export class FreshBooksService {
     const continuedSeconds = Math.max(0, Number(timer.continuedSeconds) || 0);
     const closedSeconds = continuedSeconds
       + closed.reduce((total, segment) => total + Number(segment.duration || 0), 0);
+    const replacements = [];
     if (timer.running) {
       if (targetSeconds < closedSeconds) {
         throw new CliError("Duration cannot be shorter than completed timer segments", {
@@ -541,9 +559,12 @@ export class FreshBooksService {
       }
       const startedAt = new Date(this.now().getTime() - (targetSeconds - closedSeconds) * 1000).toISOString();
       for (const segment of timer._segments) {
-        await this.updateTimerSegment(segment, segment.id === timer._openSegment.id
-          ? { started_at: startedAt, local_started_at: startedAt }
-          : {});
+        replacements.push(await this.updateTimerSegment(
+          segment,
+          segment.id === timer._openSegment.id
+            ? { started_at: startedAt, local_started_at: startedAt }
+            : {},
+        ));
       }
     } else {
       const last = closed.at(-1);
@@ -555,27 +576,33 @@ export class FreshBooksService {
           details: { minimumSeconds: priorSeconds },
         });
       }
-      await this.updateTimerSegment(last, { duration: targetSeconds - priorSeconds });
+      replacements.push(await this.updateTimerSegment(last, { duration: targetSeconds - priorSeconds }));
     }
-    const updated = await this.requireRefreshedTimer(timer.id);
+    const updated = this.timerWithReplacements(timer, replacements);
     return this.activeTimerReceipt("timer-correct", before, updated);
   }
 
   async updateTimer(timerId, patch, { guard } = {}) {
     const timer = await this.guardedActiveTimer(timerId, guard);
     const before = this.currentTimerRecord(timer);
-    for (const segment of timer._segments) await this.updateTimerSegment(segment, patch);
-    const updated = await this.requireRefreshedTimer(timer.id);
+    const replacements = [];
+    for (const segment of timer._segments) {
+      replacements.push(await this.updateTimerSegment(segment, patch));
+    }
+    const updated = this.timerWithReplacements(timer, replacements);
     return this.activeTimerReceipt("timer-update", before, updated);
   }
 
   async logTimer(timerId, { guard } = {}) {
-    let timer = await this.guardedActiveTimer(timerId, guard);
+    const timer = await this.guardedActiveTimer(timerId, guard);
     const before = this.currentTimerRecord(timer);
-    if (timer.running) timer = await this.pauseTimerState(timer);
     const { project, abilities } = await this.timerProject(timer.projectId);
     const selectedService = selectProjectService(project, timer.serviceId);
     assertTrackableProject(project, selectedService, abilities);
+    return this.logTimerState(timer, before);
+  }
+
+  async logTimerState(timer, before) {
     const businessId = await this.businessId();
     const payload = await this.client.request(`/comments/business/${businessId}/timers/${timer.id}`, {
       method: "PUT",
@@ -606,12 +633,32 @@ export class FreshBooksService {
       });
     }
     requireTimerMutationGuard(timerId, guard);
-    const { project, abilities } = await this.timerProject(fields.project_id);
-    const service = selectProjectService(project, fields.service_id);
-    assertTrackableProject(project, service, abilities);
-    const logged = await this.logTimer(timerId, { guard });
+    const [timerResult, target, config] = await Promise.all([
+      this.activeTimer(timerId).then(
+        (timer) => ({ timer }),
+        (error) => ({ error }),
+      ),
+      this.timerProject(fields.project_id),
+      this.configStore.read(),
+    ]);
+    const service = selectProjectService(target.project, fields.service_id);
+    assertTrackableProject(target.project, service, target.abilities);
+    if (timerResult.error) throw timerResult.error;
+    const timer = timerResult.timer;
+    const before = this.currentTimerRecord(timer);
+    assertGuard(guard, before);
+    const rememberedIdentity = timer._segments.at(-1)?.identity_id
+      ?? timer._continuedSegments.at(-1)?.identity_id;
+    const identity = rememberedIdentity == null
+      ? await this.identity()
+      : { id: rememberedIdentity };
+    const logged = await this.logTimerState(timer, before);
     try {
-      const started = await this.startTimer(fields);
+      const started = await this.startTimerState(fields, {
+        identity,
+        ...target,
+        timezone: config.timezone,
+      });
       return receipt(
         "timer-switch",
         [...logged.changes, ...started.changes],
@@ -669,13 +716,38 @@ export class FreshBooksService {
     return payload?.time_entry || payload;
   }
 
-  async requireRefreshedTimer(timerId) {
-    const timer = (await this.activeTimers()).find((candidate) => candidate.id === timerId);
-    if (!timer) {
+  timerSegments(timer) {
+    return [...timer._continuedSegments, ...timer._segments];
+  }
+
+  timerWithReplacements(timer, replacements) {
+    const byId = new Map(replacements.map((segment) => [String(segment.id), segment]));
+    const segments = this.timerSegments(timer).map((segment) => {
+      const replacement = byId.get(String(segment.id));
+      if (!replacement) return segment;
+      byId.delete(String(segment.id));
+      return {
+        ...segment,
+        ...replacement,
+        timer: replacement.timer ?? segment.timer,
+      };
+    });
+    return this.rememberTimerSegments([...segments, ...byId.values()], timer.id);
+  }
+
+  rememberTimerSegments(segments, timerId) {
+    const context = this.requireTracking();
+    const current = canonicalActiveTimers(segments, {
+      observedAt: context.observedAt,
+    }).find((candidate) => candidate.id === String(timerId));
+    const timer = groupTimerSegments(segments, this.now())
+      .find((candidate) => String(candidate.id) === String(timerId));
+    if (!current || !timer) {
       throw new CliError("FreshBooks did not return the expected active timer", {
         code: "TIMER_RECONCILIATION_FAILED",
       });
     }
+    context.remember(current);
     return timer;
   }
   async guardedTimeEntry(entryId, guard) {

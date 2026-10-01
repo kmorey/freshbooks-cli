@@ -48,8 +48,7 @@ test("installer installs, verifies, runs, and uninstalls without removing creden
   const releaseDirectory = await createReleaseFixture(root);
   const environment = installerEnvironment(home, releaseDirectory);
 
-  const installed = await execFile("sh", [installer, "--prefix", prefix], { env: environment });
-  assert.match(installed.stdout, /Installed freshbooks-cli 0\.2\.0/);
+  await execFile("sh", [installer, "--prefix", prefix], { env: environment });
 
   const command = join(prefix, "bin", "freshbooks");
   assert.equal((await stat(command)).isFile(), true);

@@ -2,8 +2,26 @@ import { setTimeout as delay } from "node:timers/promises";
 import { ApiError, CliError } from "./errors.js";
 import { refreshAccessToken, withRefreshLock } from "./auth.js";
 
+const NETWORK_TIMEOUT_MS = 15_000;
+const AUTH_REPLAY_COUNT = 1;
+const MAX_RATE_RETRIES = 3;
+const MAX_RATE_WAIT_MS = 10_000;
+const DEADLINE_SLACK_MS = 4_000;
+const REQUEST_BUDGET_MS =
+  NETWORK_TIMEOUT_MS * (1 + AUTH_REPLAY_COUNT)
+  + MAX_RATE_RETRIES * MAX_RATE_WAIT_MS
+  + DEADLINE_SLACK_MS;
+
+export const COMMAND_BUDGETS_MS = Object.freeze({
+  read: REQUEST_BUDGET_MS,
+  singleWrite: REQUEST_BUDGET_MS * 2,
+  multiSegment: REQUEST_BUDGET_MS * 5,
+  log: REQUEST_BUDGET_MS * 3,
+  switch: REQUEST_BUDGET_MS * 5,
+});
+
 export class FreshBooksClient {
-  constructor({ configStore, secretStore, fetcher = fetch, now = () => new Date(), timeoutMs = 15000 }) {
+  constructor({ configStore, secretStore, fetcher = fetch, now = () => new Date(), timeoutMs = NETWORK_TIMEOUT_MS }) {
     this.configStore = configStore;
     this.secretStore = secretStore;
     this.fetcher = fetcher;
