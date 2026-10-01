@@ -244,13 +244,12 @@ export class FreshBooksService {
 
   async updateTimeEntry(entryId, patch, { guard } = {}) {
     const { existing, current: before } = await this.guardedTimeEntry(entryId, guard);
-    const entry = writableTimeEntry(existing);
+    const entry = Object.assign(writableTimeEntry(existing), compact(patch));
     if (patch.project_id !== undefined || patch.service_id !== undefined) {
       delete entry.client_id;
       delete entry.billable;
       delete entry.internal;
     }
-    Object.assign(entry, compact(patch));
     const businessId = await this.businessId();
     const payload = await this.client.request(
       `/timetracking/business/${businessId}/time_entries/${entryId}`,

@@ -123,7 +123,13 @@ test("guarded time-entry updates and deletes use one detail read and one mutatio
     } else if (operation === "assignment-update") {
       const result = await service.updateTimeEntry(
         9,
-        { project_id: 99, service_id: 77 },
+        {
+          project_id: 99,
+          service_id: 77,
+          client_id: 999,
+          billable: true,
+          internal: false,
+        },
         { guard },
       );
       assert.equal(written.project_id, 99);
