@@ -468,11 +468,23 @@ export class FreshBooksService {
       `/comments/business/${businessId}/time_entries/${created.id}`,
       { method: "PUT", body: { time_entry: assigned } },
     );
-    return this.requireRefreshedTimer(created.timer.id);
+    const timer = await this.requireRefreshedTimer(created.timer.id);
+    const result = this.currentTimerRecord(timer);
+    return receipt("timer-start", [{
+      scope: recordScope(result),
+      before: { absent: true },
+      after: { record: result },
+    }], [result]);
   }
 
   async pauseTimer(timerId, { guard } = {}) {
     const timer = await this.guardedActiveTimer(timerId, guard);
+    const before = this.currentTimerRecord(timer);
+    const updated = await this.pauseTimerState(timer);
+    return this.activeTimerReceipt("timer-pause", before, updated);
+  }
+
+  async pauseTimerState(timer) {
     if (!timer.running || !timer._openSegment) return timer;
     const duration = Math.max(
       0,
@@ -484,28 +496,32 @@ export class FreshBooksService {
 
   async resumeTimer(timerId, { guard } = {}) {
     const timer = await this.guardedActiveTimer(timerId, guard);
-    if (timer.running) return timer;
-    const template = timer._segments.at(-1);
-    const businessId = await this.businessId();
-    await this.client.request(`/comments/business/${businessId}/time_entries`, {
-      method: "POST",
-      body: {
-        time_entry: timerEntryFields({
-          ...template,
-          id: undefined,
-          duration: null,
-          started_at: this.now().toISOString(),
-          local_started_at: null,
-          identity_id: null,
-          timer: { id: timer.id },
-        }),
-      },
-    });
-    return this.requireRefreshedTimer(timer.id);
+    const before = this.currentTimerRecord(timer);
+    if (!timer.running) {
+      const template = timer._segments.at(-1);
+      const businessId = await this.businessId();
+      await this.client.request(`/comments/business/${businessId}/time_entries`, {
+        method: "POST",
+        body: {
+          time_entry: timerEntryFields({
+            ...template,
+            id: undefined,
+            duration: null,
+            started_at: this.now().toISOString(),
+            local_started_at: null,
+            identity_id: null,
+            timer: { id: timer.id },
+          }),
+        },
+      });
+    }
+    const updated = timer.running ? timer : await this.requireRefreshedTimer(timer.id);
+    return this.activeTimerReceipt("timer-resume", before, updated);
   }
 
   async correctTimer(timerId, targetSeconds, { guard } = {}) {
     const timer = await this.guardedActiveTimer(timerId, guard);
+    const before = this.currentTimerRecord(timer);
     if (!Number.isSafeInteger(targetSeconds) || targetSeconds < 0) {
       throw new CliError("Timer duration must be whole non-negative seconds", {
         code: "INVALID_DURATION",
@@ -541,22 +557,22 @@ export class FreshBooksService {
       }
       await this.updateTimerSegment(last, { duration: targetSeconds - priorSeconds });
     }
-    return this.requireRefreshedTimer(timer.id);
+    const updated = await this.requireRefreshedTimer(timer.id);
+    return this.activeTimerReceipt("timer-correct", before, updated);
   }
 
   async updateTimer(timerId, patch, { guard } = {}) {
     const timer = await this.guardedActiveTimer(timerId, guard);
+    const before = this.currentTimerRecord(timer);
     for (const segment of timer._segments) await this.updateTimerSegment(segment, patch);
-    return this.requireRefreshedTimer(timer.id);
+    const updated = await this.requireRefreshedTimer(timer.id);
+    return this.activeTimerReceipt("timer-update", before, updated);
   }
 
   async logTimer(timerId, { guard } = {}) {
     let timer = await this.guardedActiveTimer(timerId, guard);
-    if (timer.running) {
-      timer = await this.pauseTimer(timer.id, {
-        guard: this.currentTimerRecord(timer).token,
-      });
-    }
+    const before = this.currentTimerRecord(timer);
+    if (timer.running) timer = await this.pauseTimerState(timer);
     const { project, abilities } = await this.timerProject(timer.projectId);
     const selectedService = selectProjectService(project, timer.serviceId);
     assertTrackableProject(project, selectedService, abilities);
@@ -566,13 +582,20 @@ export class FreshBooksService {
       body: { timer: { time_entries: timer._segments.map((segment) => timerEntryFields(segment)) } },
     });
     const entry = payload?.time_entry || payload?.timer?.time_entry || payload?.timer || payload;
-    const timezone = (await this.configStore.read()).timezone;
-    return {
-      ...presentTimeEntry(entry, { timezone }),
-      timerId: timer.id,
-      elapsedSeconds: timer.elapsedSeconds,
-      elapsed: formatDuration(timer.elapsedSeconds),
-    };
+    const context = this.requireTracking();
+    const logged = context.remember(canonicalTimeEntry(entry, {
+      timezone: context.timezone,
+    }));
+    const deleted = context.remember(canonicalDeleted("active-timer", timer.id));
+    return receipt("timer-log", [{
+      scope: recordScope(logged),
+      before: { absent: true },
+      after: { record: logged },
+    }, {
+      scope: recordScope(deleted),
+      before: { token: before.token },
+      after: { deleted: true },
+    }], [logged, deleted]);
   }
 
   async switchTimer(timerId, fields, { guard } = {}) {
@@ -588,23 +611,52 @@ export class FreshBooksService {
     assertTrackableProject(project, service, abilities);
     const logged = await this.logTimer(timerId, { guard });
     try {
-      const timer = await this.startTimer(fields);
-      return { logged, timer, partial: false };
+      const started = await this.startTimer(fields);
+      return receipt(
+        "timer-switch",
+        [...logged.changes, ...started.changes],
+        [...logged.results, ...started.results],
+        { log: "confirmed", start: "confirmed" },
+      );
     } catch (error) {
-      if (logged) {
-        throw new CliError("The previous timer logged, but the next timer did not start", {
-          code: "TIMER_SWITCH_PARTIAL",
-          details: { logged, startError: { code: error.code, message: error.message } },
-        });
-      }
-      throw error;
+      const partialReceipt = receipt(
+        "timer-switch",
+        logged.changes,
+        logged.results,
+        { log: "confirmed", start: "failed" },
+      );
+      throw new CliError("The previous timer logged, but the next timer did not start", {
+        code: "TIMER_SWITCH_PARTIAL",
+        details: {
+          partialReceipt,
+          startError: {
+            code: error?.code || "UNEXPECTED_ERROR",
+            message: error instanceof Error ? error.message : String(error),
+          },
+        },
+      });
     }
   }
 
   async discardTimer(timerId, { guard } = {}) {
     const timer = await this.guardedActiveTimer(timerId, guard);
+    const before = this.currentTimerRecord(timer);
     for (const segment of timer._segments) await this.deleteTimeEntryRecord(segment.id);
-    return { id: timer.id, segmentIds: timer.activeSegmentIds, deleted: true };
+    const deleted = this.requireTracking().remember(canonicalDeleted("active-timer", timer.id));
+    return receipt("timer-discard", [{
+      scope: recordScope(deleted),
+      before: { token: before.token },
+      after: { deleted: true },
+    }], [deleted]);
+  }
+
+  activeTimerReceipt(mutationKind, before, timer) {
+    const after = this.currentTimerRecord(timer);
+    return receipt(mutationKind, [{
+      scope: recordScope(after),
+      before: { token: before.token },
+      after: { record: after },
+    }], [after]);
   }
 
   async updateTimerSegment(segment, patch) {

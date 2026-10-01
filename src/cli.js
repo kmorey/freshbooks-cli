@@ -289,37 +289,45 @@ async function timerCommand({ action, argument, options, output, service, bindTr
       });
     }
     service = await bindTracking();
-    const timer = await service.startTimer(fields, { force: options.force });
-    output.success(timer, `Started FreshBooks timer #${timer.id}.`);
+    const result = await service.startTimer(fields, { force: options.force });
+    const timer = receiptResult(result, "active-timer");
+    output.success(result, `Started FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "log") {
     const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
-    const entry = await service.logTimer(timerId, { guard });
-    output.success(entry, `Logged ${entry.elapsed} to FreshBooks (#${entry.id}).`);
+    const result = await service.logTimer(timerId, { guard });
+    const entry = receiptResult(result, "time-entry");
+    output.success(result, `Logged ${formatDuration(entry.durationSeconds)} to FreshBooks (#${entry.id}).`);
     return 0;
   }
   if (action === "pause") {
     const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
-    const timer = await service.pauseTimer(timerId, { guard });
-    output.success(timer, `Paused FreshBooks timer #${timer.id}.`);
+    const result = await service.pauseTimer(timerId, { guard });
+    const timer = receiptResult(result, "active-timer");
+    output.success(result, `Paused FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "resume") {
     const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
-    const timer = await service.resumeTimer(timerId, { guard });
-    output.success(timer, `Resumed FreshBooks timer #${timer.id}.`);
+    const result = await service.resumeTimer(timerId, { guard });
+    const timer = receiptResult(result, "active-timer");
+    output.success(result, `Resumed FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "correct") {
     const duration = parseDuration(requireOption(options, "duration"));
     const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
-    const timer = await service.correctTimer(timerId, duration, { guard });
-    output.success(timer, `Corrected FreshBooks timer #${timer.id} to ${timer.elapsed}.`);
+    const result = await service.correctTimer(timerId, duration, { guard });
+    const timer = receiptResult(result, "active-timer");
+    output.success(
+      result,
+      `Corrected FreshBooks timer #${timer.id} to ${formatDuration(canonicalTimerElapsed(timer))}.`,
+    );
     return 0;
   }
   if (action === "update") {
@@ -328,8 +336,9 @@ async function timerCommand({ action, argument, options, output, service, bindTr
     }
     const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
-    const timer = await service.updateTimer(timerId, { note: options.note }, { guard });
-    output.success(timer, `Updated FreshBooks timer #${timer.id}.`);
+    const result = await service.updateTimer(timerId, { note: options.note }, { guard });
+    const timer = receiptResult(result, "active-timer");
+    output.success(result, `Updated FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "switch") {
@@ -342,7 +351,8 @@ async function timerCommand({ action, argument, options, output, service, bindTr
     const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
     const result = await service.switchTimer(timerId, fields, { guard });
-    output.success(result, `Switched to FreshBooks timer #${result.timer.id}.`);
+    const timer = receiptResult(result, "active-timer");
+    output.success(result, `Switched to FreshBooks timer #${timer.id}.`);
     return 0;
   }
   if (action === "discard") {
@@ -355,7 +365,8 @@ async function timerCommand({ action, argument, options, output, service, bindTr
     const guard = requireTimerGuard(options, timerId);
     service = await bindTracking();
     const result = await service.discardTimer(timerId, { guard });
-    output.success(result, `Discarded FreshBooks timer #${result.id}.`);
+    const timer = receiptResult(result, "active-timer", false);
+    output.success(result, `Discarded FreshBooks timer #${timer.id}.`);
     return 0;
   }
   throw unknownAction("timer", action);
@@ -458,6 +469,18 @@ async function timeCommand({ action, argument, options, output, service, bindTra
     return 0;
   }
   throw unknownAction("time", action);
+}
+
+function receiptResult(receiptValue, kind, exists = true) {
+  const result = receiptValue?.results?.find(
+    (record) => record.kind === kind && record.exists === exists,
+  );
+  if (!result) {
+    throw new CliError(`FreshBooks did not return the expected ${kind} mutation result`, {
+      code: "INVALID_API_RESPONSE",
+    });
+  }
+  return result;
 }
 
 function requireTimerGuard(options, timerId) {
