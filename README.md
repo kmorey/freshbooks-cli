@@ -109,7 +109,7 @@ freshbooks time update 98765 --guard GUARD_TOKEN --date 2026-09-03 --duration 1h
 freshbooks time delete 98765 --guard GUARD_TOKEN --yes
 ```
 
-Calendar dates use the configured FreshBooks timezone, including daylight-saving transitions. Set `FRESHBOOKS_TIMEZONE` to the account's IANA timezone (for example, `America/Chicago`) when it differs from the machine timezone. Entry creation derives client, internal, and billability fields from the selected FreshBooks project service. Guarded assignment changes preserve the complete existing record, submit the new project/service in the single update, and canonicalize the confirmed response.
+Calendar dates use the configured FreshBooks timezone, including daylight-saving transitions. Set `FRESHBOOKS_TIMEZONE` to the account's IANA timezone (for example, `America/Chicago`) when it differs from the machine timezone. Entry creation derives client, internal, and billability fields from the selected FreshBooks project service. Guarded assignment changes preserve all non-derived fields in the single update, omit stale client/internal/billability values so FreshBooks can validate and derive the new assignment, and canonicalize the confirmed response.
 
 ## Quickshell contract
 

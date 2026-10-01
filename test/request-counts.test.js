@@ -81,20 +81,37 @@ test("guarded time-entry updates and deletes use one detail read and one mutatio
     started_at: "2026-09-01T14:00:00Z",
     local_timezone: "America/Chicago",
     project_id: 44,
+    client_id: 55,
     service_id: 66,
     note: "Before",
+    billable: true,
+    internal: false,
   };
   const guard = canonicalTimeEntry(raw, { timezone: "America/Chicago" }).token;
 
-  for (const operation of ["update", "assignment-update", "delete"]) {
+  for (const operation of ["update", "assignment-update", "assignment-rejection", "delete"]) {
     const requests = [];
     let written;
     const client = { async request(path, options = {}) {
       requests.push({ path, method: options.method || "GET" });
-      if (path === "/comments/business/123/project/99") return projectPayload(99, 77);
       if (!options.method) return { time_entry: raw };
       if (options.method === "PUT") {
         written = options.body.time_entry;
+        if (operation === "assignment-rejection") {
+          throw Object.assign(new Error("FreshBooks rejected the assignment"), {
+            code: "API_ERROR",
+            status: 422,
+          });
+        }
+        if (operation === "assignment-update") {
+          return { time_entry: {
+            ...raw,
+            ...written,
+            client_id: 77,
+            billable: false,
+            internal: true,
+          } };
+        }
         return { time_entry: { ...raw, ...written, note: "After" } };
       }
       return {};
@@ -104,9 +121,24 @@ test("guarded time-entry updates and deletes use one detail read and one mutatio
     if (operation === "update") {
       await service.updateTimeEntry(9, { note: "After" }, { guard });
     } else if (operation === "assignment-update") {
-      await service.updateTimeEntry(9, { project_id: 99, service_id: 77 }, { guard });
+      const result = await service.updateTimeEntry(
+        9,
+        { project_id: 99, service_id: 77 },
+        { guard },
+      );
       assert.equal(written.project_id, 99);
       assert.equal(written.service_id, 77);
+      assert.equal(Object.hasOwn(written, "client_id"), false);
+      assert.equal(Object.hasOwn(written, "billable"), false);
+      assert.equal(Object.hasOwn(written, "internal"), false);
+      assert.equal(result.results[0].clientId, "77");
+      assert.equal(result.results[0].billable, false);
+      assert.equal(result.results[0].internal, undefined);
+    } else if (operation === "assignment-rejection") {
+      await assert.rejects(
+        service.updateTimeEntry(9, { project_id: 99, service_id: 77 }, { guard }),
+        { code: "API_ERROR", status: 422 },
+      );
     } else {
       await service.deleteTimeEntry(9, { guard });
     }

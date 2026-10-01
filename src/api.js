@@ -29,6 +29,7 @@ export class FreshBooksClient {
     timeoutMs = NETWORK_TIMEOUT_MS,
     requestBudgetMs = REQUEST_BUDGET_MS,
     sleeper = delay,
+    clock = Date.now,
   }) {
     this.configStore = configStore;
     this.secretStore = secretStore;
@@ -37,12 +38,14 @@ export class FreshBooksClient {
     this.timeoutMs = timeoutMs;
     this.requestBudgetMs = requestBudgetMs;
     this.sleeper = sleeper;
+    this.clock = clock;
   }
 
   async request(path, options = {}) {
     const method = options.method || "GET";
     const deadline = {
-      at: Date.now() + this.requestBudgetMs,
+      at: this.clock() + this.requestBudgetMs,
+      clock: this.clock,
       signal: AbortSignal.timeout(this.requestBudgetMs),
     };
     try {
@@ -59,7 +62,7 @@ export class FreshBooksClient {
     deadline,
   ) {
     throwIfExpired(deadline);
-    const config = await withAbort(this.configStore.read(), deadline.signal);
+    const config = await withinDeadline(this.configStore.read(), deadline);
     const token = await this.accessToken(config, deadline);
     const url = new URL(path, config.apiBase);
     for (const [key, value] of Object.entries(query || {})) {
@@ -75,12 +78,12 @@ export class FreshBooksClient {
     const requestSignal = this.networkSignal(deadline);
     let response;
     try {
-      response = await withAbort(this.fetcher(url, {
+      response = await withinDeadline(this.fetcher(url, {
         method,
         headers,
         signal: requestSignal,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      }), requestSignal);
+      }), deadline, requestSignal);
     } catch (error) {
       if (isTimeout(error) || requestSignal.aborted) throw timeoutError(method);
       throw new CliError("FreshBooks API transport failed", {
@@ -107,9 +110,9 @@ export class FreshBooksClient {
         MAX_RATE_WAIT_MS / 1000,
         Math.max(1, Number(response.headers.get("retry-after")) || 1),
       );
-      await withAbort(
+      await withinDeadline(
         this.sleeper(retryAfter * 1000, undefined, { signal: deadline.signal }),
-        deadline.signal,
+        deadline,
       );
       return this.requestWithRetries(path, {
         method,
@@ -121,7 +124,7 @@ export class FreshBooksClient {
       }, deadline);
     }
 
-    const payload = await withAbort(responsePayload(response), requestSignal);
+    const payload = await withinDeadline(responsePayload(response), deadline, requestSignal);
     if (!response.ok) {
       throw new ApiError(apiMessage(payload, response.status), {
         status: response.status,
@@ -141,7 +144,7 @@ export class FreshBooksClient {
   }
 
   async accessToken(config, deadline) {
-    const secrets = await withAbort(this.secretStore.read(config.profile), deadline.signal);
+    const secrets = await withinDeadline(this.secretStore.read(config.profile), deadline);
     if (!secrets.accessToken) {
       throw new CliError("Run `freshbooks auth login` first", { code: "AUTH_REQUIRED", exitCode: 4 });
     }
@@ -152,8 +155,8 @@ export class FreshBooksClient {
 
   async forceRefresh(config, { rejectedToken, deadline }) {
     throwIfExpired(deadline);
-    return withAbort(withRefreshLock(this.configStore.paths.refreshLock, async () => {
-      const latest = await withAbort(this.secretStore.read(config.profile), deadline.signal);
+    return withinDeadline(withRefreshLock(this.configStore.paths.refreshLock, async () => {
+      const latest = await withinDeadline(this.secretStore.read(config.profile), deadline);
       const expiry = latest.expiresAt ? new Date(latest.expiresAt).getTime() : 0;
       if (rejectedToken && latest.accessToken && latest.accessToken !== rejectedToken) {
         return latest.accessToken;
@@ -164,29 +167,30 @@ export class FreshBooksClient {
         const signal = options.signal
           ? AbortSignal.any([options.signal, refreshSignal])
           : refreshSignal;
-        const response = await withAbort(
+        const response = await withinDeadline(
           this.fetcher(url, { ...options, signal }),
+          deadline,
           signal,
         );
-        return boundedResponse(response, signal);
+        return boundedResponse(response, signal, deadline);
       };
       const refreshed = await refreshAccessToken({ config, secrets: latest, fetcher });
       throwIfExpired(deadline);
-      await withAbort(
+      await withinDeadline(
         this.secretStore.write(config.profile, { ...latest, ...refreshed }),
-        deadline.signal,
+        deadline,
       );
       return refreshed.accessToken;
-    }, { timeoutMs: remainingMs(deadline) }), deadline.signal);
+    }, { timeoutMs: remainingMs(deadline) }), deadline);
   }
 }
 
 function remainingMs(deadline) {
-  return Math.max(1, deadline.at - Date.now());
+  return Math.max(1, deadline.at - deadline.clock());
 }
 
 function throwIfExpired(deadline) {
-  if (deadline.signal.aborted || Date.now() >= deadline.at) {
+  if (deadline.signal.aborted || deadline.clock() >= deadline.at) {
     throw deadline.signal.reason || Object.assign(new Error("timed out"), { name: "TimeoutError" });
   }
 }
@@ -221,11 +225,17 @@ function withAbort(promise, signal) {
   });
 }
 
-function boundedResponse(response, signal) {
+async function withinDeadline(promise, deadline, signal = deadline.signal) {
+  const value = await withAbort(promise, signal);
+  throwIfExpired(deadline);
+  return value;
+}
+
+function boundedResponse(response, signal, deadline) {
   return new Proxy(response, {
     get(target, property) {
       if (property === "text") {
-        return () => withAbort(target.text(), signal);
+        return () => withinDeadline(target.text(), deadline, signal);
       }
       const value = Reflect.get(target, property, target);
       return typeof value === "function" ? value.bind(target) : value;

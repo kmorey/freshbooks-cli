@@ -133,31 +133,75 @@ test("rate retries and one auth replay share one bounded request deadline", asyn
   assert.equal(secrets.refreshToken, "new-refresh");
 });
 
-test("the absolute request deadline includes response-body consumption", async () => {
+test("combined retries expire at one deterministic absolute boundary", async () => {
+  let elapsedMs = 0;
+  let dataAttempts = 0;
+  let refreshes = 0;
+  let secrets = {
+    clientSecret: "client-secret",
+    accessToken: "stale-access",
+    refreshToken: "old-refresh",
+    expiresAt: "2026-09-02T00:00:00Z",
+  };
+  const config = {
+    clientId: "client-id",
+    redirectUri: "https://localhost/callback",
+    apiBase: "https://api.freshbooks.test",
+    profile: "deadline",
+  };
   const configStore = {
-    async read() { return { apiBase: "https://api.freshbooks.test", profile: "default" }; },
+    paths: { refreshLock: join(tmpdir(), `freshbooks-cli-deadline-${process.pid}-${Date.now()}.lock`) },
+    async read() { return config; },
   };
   const secretStore = {
-    async read() { return { accessToken: "test", expiresAt: "2099-01-01T00:00:00Z" }; },
+    async read() { return { ...secrets }; },
+    async write(_profile, next) { secrets = { ...next }; },
   };
+  const response = (status, payload, { bodyCostMs = 0, headers } = {}) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    headers: new Headers(headers),
+    async text() {
+      elapsedMs += bodyCostMs;
+      return JSON.stringify(payload);
+    },
+  });
   const client = new FreshBooksClient({
     configStore,
     secretStore,
-    requestBudgetMs: 5,
-    fetcher: async () => ({
-      ok: true,
-      status: 200,
-      async text() {
-        await new Promise((resolve) => setTimeout(resolve, 30));
-        return "{}";
-      },
-    }),
+    requestBudgetMs: 2_000,
+    clock: () => elapsedMs,
+    sleeper: async (milliseconds) => { elapsedMs += milliseconds; },
+    now: () => new Date("2026-09-01T12:00:00Z"),
+    fetcher: async (url) => {
+      if (String(url).endsWith("/auth/oauth/token")) {
+        refreshes += 1;
+        return response(200, {
+          access_token: "fresh-access",
+          refresh_token: "new-refresh",
+          created_at: 1_788_271_200,
+          expires_in: 43_200,
+        }, { bodyCostMs: 400 });
+      }
+      dataAttempts += 1;
+      if (dataAttempts === 1) {
+        return response(429, { message: "slow down" }, {
+          headers: { "retry-after": "1" },
+        });
+      }
+      if (dataAttempts === 2) return response(401, { message: "expired" });
+      return response(200, { time_entries: [] }, { bodyCostMs: 600 });
+    },
   });
 
   await assert.rejects(
     client.request("/timetracking/business/123/time_entries"),
     { code: "API_TIMEOUT", outcomeUnknown: false },
   );
+  assert.equal(elapsedMs, 2_000);
+  assert.equal(dataAttempts, 3);
+  assert.equal(refreshes, 1);
+  assert.equal(secrets.refreshToken, "new-refresh");
 });
 
 test("a timed-out mutation reports an ambiguous outcome", async () => {
