@@ -109,7 +109,7 @@ freshbooks time update 98765 --guard GUARD_TOKEN --date 2026-09-03 --duration 1h
 freshbooks time delete 98765 --guard GUARD_TOKEN --yes
 ```
 
-Calendar dates use the configured FreshBooks timezone, including daylight-saving transitions. Set `FRESHBOOKS_TIMEZONE` to the account's IANA timezone (for example, `America/Chicago`) when it differs from the machine timezone. Entry create and project/service changes derive client, internal, and billability fields from the selected FreshBooks project service.
+Calendar dates use the configured FreshBooks timezone, including daylight-saving transitions. Set `FRESHBOOKS_TIMEZONE` to the account's IANA timezone (for example, `America/Chicago`) when it differs from the machine timezone. Entry creation derives client, internal, and billability fields from the selected FreshBooks project service. Guarded assignment changes preserve the complete existing record, submit the new project/service in the single update, and canonicalize the confirmed response.
 
 ## Quickshell contract
 
@@ -194,7 +194,7 @@ Successful mutations do not issue confirmation GETs. Their receipts are construc
 }
 ```
 
-The diagnostics capability list includes `canonical-tracking-v2` and `mutation-receipts`. Treat the operation-aware budgets as maximum CLI coordination deadlines; they account for the 15-second network timeout, one authentication replay, bounded rate-limit waits, and each workflow's sequential request ceiling.
+The diagnostics capability list includes `canonical-tracking-v2` and `mutation-receipts`. Treat the operation-aware budgets as maximum CLI coordination deadlines. Each API operation enforces one absolute 64-second deadline across the 15-second network attempts, one authentication refresh/replay, up to three bounded rate-limit waits, and response-body consumption; workflow budgets multiply that bound by their sequential request ceiling.
 
 Errors are written to standard error with a non-zero exit status:
 

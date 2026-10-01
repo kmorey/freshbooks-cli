@@ -72,7 +72,7 @@ function nextTurn() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-test("guarded time-entry update and delete use one detail read and one mutation", async () => {
+test("guarded time-entry updates and deletes use one detail read and one mutation", async () => {
   const raw = {
     id: 9,
     identity_id: 88,
@@ -86,23 +86,36 @@ test("guarded time-entry update and delete use one detail read and one mutation"
   };
   const guard = canonicalTimeEntry(raw, { timezone: "America/Chicago" }).token;
 
-  for (const operation of ["update", "delete"]) {
+  for (const operation of ["update", "assignment-update", "delete"]) {
     const requests = [];
+    let written;
     const client = { async request(path, options = {}) {
       requests.push({ path, method: options.method || "GET" });
+      if (path === "/comments/business/123/project/99") return projectPayload(99, 77);
       if (!options.method) return { time_entry: raw };
-      if (options.method === "PUT") return { time_entry: { ...raw, note: "After" } };
+      if (options.method === "PUT") {
+        written = options.body.time_entry;
+        return { time_entry: { ...raw, ...written, note: "After" } };
+      }
       return {};
     } };
     const service = serviceFor(client);
 
     if (operation === "update") {
       await service.updateTimeEntry(9, { note: "After" }, { guard });
+    } else if (operation === "assignment-update") {
+      await service.updateTimeEntry(9, { project_id: 99, service_id: 77 }, { guard });
+      assert.equal(written.project_id, 99);
+      assert.equal(written.service_id, 77);
     } else {
       await service.deleteTimeEntry(9, { guard });
     }
 
-    assert.deepEqual(requests.map(({ method }) => method), ["GET", operation === "update" ? "PUT" : "DELETE"]);
+    assert.deepEqual(
+      requests.map(({ method }) => method),
+      ["GET", operation === "delete" ? "DELETE" : "PUT"],
+      operation,
+    );
   }
 });
 

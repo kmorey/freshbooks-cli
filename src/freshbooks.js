@@ -244,21 +244,6 @@ export class FreshBooksService {
 
   async updateTimeEntry(entryId, patch, { guard } = {}) {
     const { existing, current: before } = await this.guardedTimeEntry(entryId, guard);
-    if (patch.project_id !== undefined || patch.service_id !== undefined) {
-      const projectId = patch.project_id ?? existing.project_id;
-      const serviceId = patch.service_id ?? existing.service_id;
-      const { project, abilities } = await this.timerProject(projectId);
-      const service = selectProjectService(project, serviceId);
-      assertTrackableProject(project, service, abilities);
-      patch = {
-        ...patch,
-        project_id: projectId,
-        client_id: project.client_id ?? null,
-        service_id: service.id,
-        billable: project.internal === true ? false : service.billable === true,
-        internal: project.internal === true,
-      };
-    }
     const entry = compact({ ...writableTimeEntry(existing), ...patch });
     const businessId = await this.businessId();
     const payload = await this.client.request(
