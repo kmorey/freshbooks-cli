@@ -9,8 +9,6 @@ import {
   recordScope,
 } from "./tracking.js";
 
-const TIMER_STATUS_PAGE_CONCURRENCY = 6;
-
 function ambiguousMutation(error, mutationKind) {
   if (error?.outcomeUnknown === true) return error;
   return new CliError("FreshBooks accepted part of the mutation, but its final outcome is unknown", {
@@ -359,7 +357,7 @@ export class FreshBooksService {
 
   async timerStatusObservation() {
     const context = this.requireTracking();
-    const entries = await this.timerCandidates({ complete: true });
+    const entries = await this.timerCandidates();
     const records = canonicalActiveTimers(entries, {
       observedAt: context.observedAt,
     });
@@ -396,31 +394,18 @@ export class FreshBooksService {
     return active[0];
   }
 
-  async timerCandidates({ complete = false } = {}) {
+  async timerCandidates() {
     const businessId = await this.businessId();
-    // include_unlogged adds running/paused entries to the ordinary time-entry
-    // result set and FreshBooks scopes the list to the authenticated user by
-    // default. Mutation discovery stays bounded to page 1, while canonical
-    // status reads traverse all reported pages before claiming completeness.
+    // FreshBooks has no active/paused-only public filter. The selected
+    // low-latency policy treats its first include_unlogged page as the timer
+    // status set instead of traversing the account's complete time history.
     // Do not add an identity_id filter: FreshBooks rejects that combination
     // with HTTP 422.
-    const firstPage = await this.client.request(
+    const payload = await this.client.request(
       `/timetracking/business/${businessId}/time_entries`,
       { query: { include_unlogged: true, per_page: 100, page: 1 } },
     );
-    const entries = [...(firstPage?.time_entries || [])];
-    const pages = complete ? Number(firstPage?.meta?.pages || 1) : 1;
-    for (let first = 2; first <= pages; first += TIMER_STATUS_PAGE_CONCURRENCY) {
-      const pageNumbers = [];
-      const last = Math.min(pages, first + TIMER_STATUS_PAGE_CONCURRENCY - 1);
-      for (let page = first; page <= last; page += 1) pageNumbers.push(page);
-      const payloads = await Promise.all(pageNumbers.map((page) => this.client.request(
-        `/timetracking/business/${businessId}/time_entries`,
-        { query: { include_unlogged: true, per_page: 100, page } },
-      )));
-      for (const payload of payloads) entries.push(...(payload?.time_entries || []));
-    }
-    return entries;
+    return payload?.time_entries || [];
   }
 
   async startTimer(fields, { force = false } = {}) {

@@ -86,7 +86,7 @@ freshbooks timer correct --id 456 --duration 1h30m --guard GUARD_TOKEN
 freshbooks timer log --id 456 --guard GUARD_TOKEN
 ```
 
-`timer status` groups Time Entries by timer identity and only exposes groups that still contain an unlogged segment. A pause closes the current unlogged segment; resume adds another segment to the same logical timer. A canonical active timer includes all timer segments, including logged continuation predecessors, while writes remain limited to active segments. `timer start` refuses to create another logical timer when one already exists.
+`timer status` groups Time Entries by timer identity and only exposes groups that still contain an unlogged segment. For low-latency desktop polling it treats FreshBooks' first `include_unlogged` page as the complete timer set; this can miss an older paused timer or additional timer that FreshBooks places on a later page. A pause closes the current unlogged segment; resume adds another segment to the same logical timer. A canonical active timer includes all timer segments present on that page, including logged continuation predecessors, while writes remain limited to active segments. `timer start` refuses to create another logical timer when one is found.
 
 Starting a timer derives client, internal, and billability fields from the selected project and service. Switching logs the current timer before starting the next one:
 
