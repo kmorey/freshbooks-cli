@@ -1037,16 +1037,25 @@ test("run creates command-scoped contexts for canonical read output", async () =
   assert.equal(timerData.records[0].id, "901");
 });
 
-test("timer status reads later pages before claiming complete coverage", async () => {
+test("timer status reads later pages concurrently before claiming complete coverage", async () => {
   const pages = [];
+  let activeRequests = 0;
+  let maxActiveRequests = 0;
   const client = { async request(path, options = {}) {
     if (path !== "/timetracking/business/123/time_entries") {
       throw new Error(`Unexpected request: ${path}`);
     }
-    pages.push(options.query.page);
-    return options.query.page === 1
-      ? { time_entries: [], meta: { pages: 2 } }
-      : { time_entries: [segment()], meta: { pages: 2 } };
+    const page = options.query.page;
+    pages.push(page);
+    if (page === 1) return { time_entries: [], meta: { pages: 4 } };
+    activeRequests += 1;
+    maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+    await new Promise((resolve) => setImmediate(resolve));
+    activeRequests -= 1;
+    return {
+      time_entries: page === 4 ? [segment()] : [],
+      meta: { pages: 4 },
+    };
   } };
   const context = new TrackingContext({
     timezone: "America/Chicago",
@@ -1056,7 +1065,8 @@ test("timer status reads later pages before claiming complete coverage", async (
 
   const observation = await service.timerStatusObservation();
 
-  assert.deepEqual(pages, [1, 2]);
+  assert.deepEqual(pages, [1, 2, 3, 4]);
+  assert.equal(maxActiveRequests, 3);
   assert.equal(observation.coverage.complete, true);
   assert.equal(observation.records[0].id, "901");
 });
