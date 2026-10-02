@@ -530,19 +530,26 @@ test("running correction treats a logged continuation predecessor as immutable",
   assert.equal(requests.filter((request) => request.method === "PUT").length, 1);
 });
 
-test("logTimer preflights the project and PUTs the logical timer resource", async () => {
+test("logTimer pauses a running timer before logging its timer resource", async () => {
   const requests = [];
-  const entries = [
+  let entries = [
     segment({ id: 899, is_logged: true, duration: 7200, started_at: "2026-09-01T12:00:00Z", timer: { id: 901, is_running: false } }),
-    segment({ id: 900, duration: 60, timer: { id: 901, is_running: false } }),
+    segment({ id: 900 }),
   ];
   const client = { async request(path, options = {}) {
     requests.push({ path, ...options });
     if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
     if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
     if (path === "/comments/business/123/project/44") return { project: { id: 44, active: true, complete: false, services: [{ id: 66, billable: true }] }, abilities: [{ name: "can_track_time", value: true }] };
+    if (path === "/comments/business/123/time_entries/900" && options.method === "PUT") {
+      entries = entries.map((entry) => entry.id === 900
+        ? { ...entry, ...options.body.time_entry, timer: { id: 901, is_running: false } }
+        : entry);
+      return { time_entry: entries.find((entry) => entry.id === 900) };
+    }
     if (path === "/comments/business/123/timers/901" && options.method === "PUT") {
-      return { time_entry: {
+      assert.notEqual(entries.find((entry) => entry.id === 900).duration, null);
+      return { timer: { time_entries: [{
         id: 903,
         is_logged: true,
         duration: 7260,
@@ -553,7 +560,7 @@ test("logTimer preflights the project and PUTs the logical timer resource", asyn
         note: "Build shell plugin",
         billable: true,
         billed: false,
-      } };
+      }] } };
     }
     throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
   } };
@@ -561,10 +568,14 @@ test("logTimer preflights the project and PUTs the logical timer resource", asyn
   const logged = await service.logTimer(901, {
     guard: await currentTimerGuard(service),
   });
-  const update = requests.find((request) => request.path.endsWith("/timers/901"));
-  assert.equal(update.body.timer.time_entries.length, 1);
-  assert.equal(update.body.timer.time_entries[0].id, undefined);
-  assert.equal(update.body.timer.time_entries[0].is_logged, false);
+  const writes = requests.filter((request) => request.method === "PUT");
+  assert.deepEqual(writes.map((request) => request.path), [
+    "/comments/business/123/time_entries/900",
+    "/comments/business/123/timers/901",
+  ]);
+  assert.equal(writes[1].body.timer.time_entries.length, 1);
+  assert.equal(writes[1].body.timer.time_entries[0].id, undefined);
+  assert.equal(writes[1].body.timer.time_entries[0].is_logged, false);
   assert.equal(logged.results[0].id, "903");
   assert.equal(logged.results[0].durationSeconds, 7260);
 });
@@ -796,9 +807,11 @@ test("log and discard return deletion changes", async () => {
   }]);
 });
 
-test("switch receipt covers old entry and new timer", async () => {
-  let entries = [segment({ duration: 60, timer: { id: 901, is_running: false } })];
+test("switch receipt stops and logs the old timer before starting the new one", async () => {
+  let entries = [segment()];
+  const requests = [];
   const client = { async request(path, options = {}) {
+    requests.push({ path, ...options });
     if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
     if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
     if (path === "/comments/business/123/project/44") return {
@@ -809,7 +822,12 @@ test("switch receipt covers old entry and new timer", async () => {
       project: { id: 99, client_id: 77, active: true, complete: false, services: [{ id: 88, billable: false }] },
       abilities: [{ name: "can_track_time", value: true }],
     };
+    if (path === "/comments/business/123/time_entries/900" && options.method === "PUT") {
+      entries = [{ ...entries[0], ...options.body.time_entry, timer: { id: 901, is_running: false } }];
+      return { time_entry: entries[0] };
+    }
     if (path === "/comments/business/123/timers/901" && options.method === "PUT") {
+      assert.notEqual(entries[0].duration, null);
       entries = [];
       return { time_entry: {
         id: 903, is_logged: true, duration: 60, started_at: "2026-09-01T14:59:00Z",
@@ -833,6 +851,14 @@ test("switch receipt covers old entry and new timer", async () => {
     { guard: await currentTimerGuard(service) },
   );
 
+  assert.deepEqual(
+    requests.filter((request) => request.method === "PUT").map((request) => request.path),
+    [
+      "/comments/business/123/time_entries/900",
+      "/comments/business/123/timers/901",
+      "/comments/business/123/time_entries/904",
+    ],
+  );
   assert.equal(result.mutationKind, "timer-switch");
   assert.deepEqual(result.phase, { log: "confirmed", start: "confirmed" });
   assert.deepEqual(result.results.map((record) => [record.kind, record.id, record.exists]), [

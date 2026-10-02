@@ -614,30 +614,47 @@ export class FreshBooksService {
     const { project, abilities } = await this.timerProject(timer.projectId);
     const selectedService = selectProjectService(project, timer.serviceId);
     assertTrackableProject(project, selectedService, abilities);
-    return this.logTimerState(timer, before);
+    return this.stopAndLogTimer(timer, before, "timer-log");
+  }
+
+  async stopAndLogTimer(timer, before, mutationKind) {
+    const paused = timer.running;
+    const stoppedTimer = paused ? await this.pauseTimerState(timer) : timer;
+    try {
+      return await this.logTimerState(stoppedTimer, before);
+    } catch (error) {
+      if (paused) throw ambiguousMutation(error, mutationKind);
+      throw error;
+    }
   }
 
   async logTimerState(timer, before) {
     const businessId = await this.businessId();
     const payload = await this.client.request(`/comments/business/${businessId}/timers/${timer.id}`, {
       method: "PUT",
-      body: { timer: { time_entries: timer._segments.map((segment) => timerEntryFields(segment)) } },
+      body: {
+        timer: {
+          time_entries: timer._segments.map((segment) => timerEntryFields({ ...segment, id: undefined })),
+        },
+      },
     });
-    const entry = payload?.time_entry || payload?.timer?.time_entry || payload?.timer || payload;
+    const logged = payload?.time_entry
+      || payload?.timer?.time_entry
+      || payload?.timer?.time_entries?.at(-1)
+      || payload?.time_entries?.at(-1)
+      || payload;
     const context = this.requireTracking();
-    const logged = context.remember(canonicalTimeEntry(entry, {
-      timezone: context.timezone,
-    }));
-    const deleted = context.remember(canonicalDeleted("active-timer", timer.id));
+    const confirmed = context.remember(canonicalTimeEntry(logged, { timezone: context.timezone }));
+    const deleted = canonicalDeleted("active-timer", timer.id);
     return receipt("timer-log", [{
-      scope: recordScope(logged),
+      scope: recordScope(confirmed),
       before: { absent: true },
-      after: { record: logged },
+      after: { record: confirmed },
     }, {
       scope: recordScope(deleted),
       before: { token: before.token },
       after: { deleted: true },
-    }], [logged, deleted]);
+    }], [confirmed, deleted]);
   }
 
   async switchTimer(timerId, fields, { guard } = {}) {
@@ -667,7 +684,7 @@ export class FreshBooksService {
     const identity = rememberedIdentity == null
       ? await this.identity()
       : { id: rememberedIdentity };
-    const logged = await this.logTimerState(timer, before);
+    const logged = await this.stopAndLogTimer(timer, before, "timer-switch");
     try {
       const started = await this.startTimerState(fields, {
         identity,
