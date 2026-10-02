@@ -605,6 +605,83 @@ test("timer start returns assigned receipt", async () => {
   assert.equal(context.get("active-timer:901"), result.results[0]);
 });
 
+test("timer start reports unknown after assignment write fails", async () => {
+  let created = false;
+  const client = { async request(path, options = {}) {
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: [] };
+    if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
+    if (path === "/comments/business/123/project/44") return {
+      project: { id: 44, client_id: 55, active: true, complete: false, services: [{ id: 66, billable: true }] },
+      abilities: [{ name: "can_track_time", value: true }],
+    };
+    if (path === "/comments/business/123/time_entries" && options.method === "POST") {
+      created = true;
+      return { time_entry: { id: 900, timer: { id: 901 } } };
+    }
+    if (path === "/comments/business/123/time_entries/900" && options.method === "PUT")
+      throw new Error("assignment failed");
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore, now }).withTracking(trackingContext());
+
+  await assert.rejects(
+    service.startTimer({ project_id: 44, service_id: 66 }),
+    error => created && error.code === "MUTATION_OUTCOME_UNKNOWN" && error.outcomeUnknown === true,
+  );
+});
+
+test("multi-segment correction and update report unknown after a confirmed write", async () => {
+  for (const operation of ["correct", "update"]) {
+    let writes = 0;
+    const entries = [
+      segment({ id: 900, duration: 30, timer: { id: 901, is_running: false } }),
+      segment({ id: 902, duration: null, timer: { id: 901, is_running: true } }),
+    ];
+    const client = { async request(path, options = {}) {
+      if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
+      if (path.startsWith("/comments/business/123/time_entries/") && options.method === "PUT") {
+        writes += 1;
+        if (writes === 2) throw new Error("second segment failed");
+        return { time_entry: { ...entries[0], ...options.body.time_entry } };
+      }
+      throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+    } };
+    const service = new FreshBooksService({ client, configStore, now }).withTracking(trackingContext());
+    const guard = await currentTimerGuard(service);
+    const call = operation === "correct"
+      ? service.correctTimer(901, 120, { guard })
+      : service.updateTimer(901, { note: "Updated" }, { guard });
+    await assert.rejects(
+      call,
+      error => writes === 2 && error.code === "MUTATION_OUTCOME_UNKNOWN" && error.outcomeUnknown === true,
+    );
+  }
+});
+
+test("multi-segment discard reports unknown after a confirmed delete", async () => {
+  let deletes = 0;
+  const entries = [
+    segment({ id: 910, duration: 30, timer: { id: 911, is_running: false } }),
+    segment({ id: 912, timer: { id: 911, is_running: true } }),
+  ];
+  const client = { async request(path, options = {}) {
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
+    if (path.startsWith("/timetracking/business/123/time_entries/") && options.method === "DELETE") {
+      deletes += 1;
+      if (deletes === 2) throw new Error("second delete failed");
+      return {};
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore, now }).withTracking(trackingContext());
+  const guard = await currentTimerGuard(service, 911);
+
+  await assert.rejects(
+    service.discardTimer(911, { guard }),
+    error => deletes === 2 && error.code === "MUTATION_OUTCOME_UNKNOWN" && error.outcomeUnknown === true,
+  );
+});
+
 test("pause resume correction and note update return logical timer receipts", async () => {
   let entries = [
     segment({ id: 900, duration: 30, started_at: "2026-09-01T14:58:00Z", timer: { id: 901, is_running: false } }),

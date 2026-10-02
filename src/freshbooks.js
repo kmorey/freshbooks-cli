@@ -9,6 +9,21 @@ import {
   recordScope,
 } from "./tracking.js";
 
+function ambiguousMutation(error, mutationKind) {
+  if (error?.outcomeUnknown === true) return error;
+  return new CliError("FreshBooks accepted part of the mutation, but its final outcome is unknown", {
+    code: "MUTATION_OUTCOME_UNKNOWN",
+    outcomeUnknown: true,
+    details: {
+      mutationKind,
+      cause: {
+        code: error?.code || "UNEXPECTED_ERROR",
+        message: error instanceof Error ? error.message : String(error),
+      },
+    },
+  });
+}
+
 export class FreshBooksService {
   constructor({ client, configStore, now = () => new Date(), trackingContext = null }) {
     this.client = client;
@@ -452,36 +467,40 @@ export class FreshBooksService {
       `/comments/business/${businessId}/time_entries`,
       { method: "POST", body: { time_entry: { ...common, note: null, internal: false, timer: {}, identity_id: null, client_id: null, project_id: null, service_id: null } } },
     );
-    const created = createdPayload?.time_entry || createdPayload;
-    if (!created?.id || !created?.timer?.id) {
-      throw new CliError("FreshBooks did not create a timer identity", {
-        code: "INVALID_API_RESPONSE",
-        details: createdPayload,
-      });
+    try {
+      const created = createdPayload?.time_entry || createdPayload;
+      if (!created?.id || !created?.timer?.id) {
+        throw new CliError("FreshBooks did not create a timer identity", {
+          code: "INVALID_API_RESPONSE",
+          details: createdPayload,
+        });
+      }
+      const assigned = {
+        ...common,
+        identity_id: identity.id,
+        timer: { id: created.timer.id },
+      };
+      const assignedPayload = await this.client.request(
+        `/comments/business/${businessId}/time_entries/${created.id}`,
+        { method: "PUT", body: { time_entry: assigned } },
+      );
+      const confirmed = {
+        ...created,
+        ...assigned,
+        ...(assignedPayload?.time_entry || assignedPayload),
+        id: created.id,
+        timer: { id: created.timer.id },
+      };
+      const timer = this.rememberTimerSegments([confirmed], created.timer.id);
+      const result = this.currentTimerRecord(timer);
+      return receipt("timer-start", [{
+        scope: recordScope(result),
+        before: { absent: true },
+        after: { record: result },
+      }], [result]);
+    } catch (error) {
+      throw ambiguousMutation(error, "timer-start");
     }
-    const assigned = {
-      ...common,
-      identity_id: identity.id,
-      timer: { id: created.timer.id },
-    };
-    const assignedPayload = await this.client.request(
-      `/comments/business/${businessId}/time_entries/${created.id}`,
-      { method: "PUT", body: { time_entry: assigned } },
-    );
-    const confirmed = {
-      ...created,
-      ...assigned,
-      ...(assignedPayload?.time_entry || assignedPayload),
-      id: created.id,
-      timer: { id: created.timer.id },
-    };
-    const timer = this.rememberTimerSegments([confirmed], created.timer.id);
-    const result = this.currentTimerRecord(timer);
-    return receipt("timer-start", [{
-      scope: recordScope(result),
-      before: { absent: true },
-      after: { record: result },
-    }], [result]);
   }
 
   async pauseTimer(timerId, { guard } = {}) {
@@ -540,47 +559,62 @@ export class FreshBooksService {
     const closedSeconds = continuedSeconds
       + closed.reduce((total, segment) => total + Number(segment.duration || 0), 0);
     const replacements = [];
-    if (timer.running) {
-      if (targetSeconds < closedSeconds) {
-        throw new CliError("Duration cannot be shorter than completed timer segments", {
-          code: "DURATION_BELOW_CLOSED_SEGMENTS",
-          details: { minimumSeconds: closedSeconds },
-        });
+    let confirmedWrites = 0;
+    try {
+      if (timer.running) {
+        if (targetSeconds < closedSeconds) {
+          throw new CliError("Duration cannot be shorter than completed timer segments", {
+            code: "DURATION_BELOW_CLOSED_SEGMENTS",
+            details: { minimumSeconds: closedSeconds },
+          });
+        }
+        const startedAt = new Date(this.now().getTime() - (targetSeconds - closedSeconds) * 1000).toISOString();
+        for (const segment of timer._segments) {
+          replacements.push(await this.updateTimerSegment(
+            segment,
+            segment.id === timer._openSegment.id
+              ? { started_at: startedAt, local_started_at: startedAt }
+              : {},
+          ));
+          confirmedWrites += 1;
+        }
+      } else {
+        const last = closed.at(-1);
+        const priorSeconds = continuedSeconds
+          + closed.slice(0, -1).reduce((total, segment) => total + Number(segment.duration || 0), 0);
+        if (!last || targetSeconds < priorSeconds) {
+          throw new CliError("Duration cannot be shorter than earlier timer segments", {
+            code: "DURATION_BELOW_CLOSED_SEGMENTS",
+            details: { minimumSeconds: priorSeconds },
+          });
+        }
+        replacements.push(await this.updateTimerSegment(last, { duration: targetSeconds - priorSeconds }));
+        confirmedWrites += 1;
       }
-      const startedAt = new Date(this.now().getTime() - (targetSeconds - closedSeconds) * 1000).toISOString();
-      for (const segment of timer._segments) {
-        replacements.push(await this.updateTimerSegment(
-          segment,
-          segment.id === timer._openSegment.id
-            ? { started_at: startedAt, local_started_at: startedAt }
-            : {},
-        ));
-      }
-    } else {
-      const last = closed.at(-1);
-      const priorSeconds = continuedSeconds
-        + closed.slice(0, -1).reduce((total, segment) => total + Number(segment.duration || 0), 0);
-      if (!last || targetSeconds < priorSeconds) {
-        throw new CliError("Duration cannot be shorter than earlier timer segments", {
-          code: "DURATION_BELOW_CLOSED_SEGMENTS",
-          details: { minimumSeconds: priorSeconds },
-        });
-      }
-      replacements.push(await this.updateTimerSegment(last, { duration: targetSeconds - priorSeconds }));
+      const updated = this.timerWithReplacements(timer, replacements);
+      return this.activeTimerReceipt("timer-correct", before, updated);
+    } catch (error) {
+      if (confirmedWrites > 0) throw ambiguousMutation(error, "timer-correct");
+      throw error;
     }
-    const updated = this.timerWithReplacements(timer, replacements);
-    return this.activeTimerReceipt("timer-correct", before, updated);
   }
 
   async updateTimer(timerId, patch, { guard } = {}) {
     const timer = await this.guardedActiveTimer(timerId, guard);
     const before = this.currentTimerRecord(timer);
     const replacements = [];
-    for (const segment of timer._segments) {
-      replacements.push(await this.updateTimerSegment(segment, patch));
+    let confirmedWrites = 0;
+    try {
+      for (const segment of timer._segments) {
+        replacements.push(await this.updateTimerSegment(segment, patch));
+        confirmedWrites += 1;
+      }
+      const updated = this.timerWithReplacements(timer, replacements);
+      return this.activeTimerReceipt("timer-update", before, updated);
+    } catch (error) {
+      if (confirmedWrites > 0) throw ambiguousMutation(error, "timer-update");
+      throw error;
     }
-    const updated = this.timerWithReplacements(timer, replacements);
-    return this.activeTimerReceipt("timer-update", before, updated);
   }
 
   async logTimer(timerId, { guard } = {}) {
@@ -678,13 +712,22 @@ export class FreshBooksService {
   async discardTimer(timerId, { guard } = {}) {
     const timer = await this.guardedActiveTimer(timerId, guard);
     const before = this.currentTimerRecord(timer);
-    for (const segment of timer._segments) await this.deleteTimeEntryRecord(segment.id);
-    const deleted = this.requireTracking().remember(canonicalDeleted("active-timer", timer.id));
-    return receipt("timer-discard", [{
-      scope: recordScope(deleted),
-      before: { token: before.token },
-      after: { deleted: true },
-    }], [deleted]);
+    let confirmedWrites = 0;
+    try {
+      for (const segment of timer._segments) {
+        await this.deleteTimeEntryRecord(segment.id);
+        confirmedWrites += 1;
+      }
+      const deleted = this.requireTracking().remember(canonicalDeleted("active-timer", timer.id));
+      return receipt("timer-discard", [{
+        scope: recordScope(deleted),
+        before: { token: before.token },
+        after: { deleted: true },
+      }], [deleted]);
+    } catch (error) {
+      if (confirmedWrites > 0) throw ambiguousMutation(error, "timer-discard");
+      throw error;
+    }
   }
 
   activeTimerReceipt(mutationKind, before, timer) {

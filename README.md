@@ -179,6 +179,8 @@ Timer switch receipts use `phase: { "log": "confirmed", "start": "confirmed" }`.
 
 Successful mutations do not issue confirmation GETs. Their receipts are constructed from the guarded discovery record, confirmed write responses, and command-scoped tracking context. Poll explicitly when a later observation is needed.
 
+Timer start assignment, multi-segment update/correction, and discard can cross more than one write seam. If a later step fails after any earlier write was confirmed, the CLI returns `MUTATION_OUTCOME_UNKNOWN` with `outcomeUnknown: true` instead of claiming the mutation was not applied. Callers must reconcile canonical state and must not retry automatically.
+
 `freshbooks diagnostics status --json` advertises the release contract:
 
 ```json
@@ -214,7 +216,7 @@ Recommended plugin behavior:
 - Poll `freshbooks timer status --json` every 15–30 seconds and immediately after actions that need a fresh observation.
 - Apply successful and partial mutation receipts before polling again.
 - Advance a running duration locally from `elapsedAnchor` instead of calling the API every second.
-- Treat `API_TIMEOUT` with `outcomeUnknown: true` as ambiguous and refresh before allowing another mutation.
+- Treat any error with `outcomeUnknown: true`, including `API_TIMEOUT` and `MUTATION_OUTCOME_UNKNOWN`, as ambiguous and refresh before allowing another mutation.
 - For in-popup onboarding, pass the OAuth client secret with `auth configure --client-secret-stdin --json` and the returned authorization URL with `auth login --code-stdin --json`.
 - Open the URL returned by `auth url --json` in the user's browser; never render or log its state parameter.
 - Do not read or copy the keyring contents into QML.
