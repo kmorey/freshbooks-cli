@@ -179,6 +179,13 @@ Timer switch receipts use `phase: { "log": "confirmed", "start": "confirmed" }`.
 
 Successful mutations do not issue confirmation GETs. Their receipts are constructed from the guarded discovery record, confirmed write responses, and command-scoped tracking context. Poll explicitly when a later observation is needed.
 
+Timer logging confirms an explicitly logged aggregate matching the timer's
+total duration and assignment; it never assumes that the last returned entry
+means the timer stopped. A response retaining an unlogged segment, missing a
+confirmed aggregate, or containing ambiguous aggregates returns
+`MUTATION_OUTCOME_UNKNOWN`. A switch does not start its replacement timer in
+that case. Reconcile before another mutation; do not automatically retry.
+
 Timer start assignment, multi-segment update/correction, and discard can cross more than one write seam. If a later step fails after any earlier write was confirmed, the CLI returns `MUTATION_OUTCOME_UNKNOWN` with `outcomeUnknown: true` instead of claiming the mutation was not applied. Callers must reconcile canonical state and must not retry automatically.
 
 `freshbooks diagnostics status --json` advertises the release contract:

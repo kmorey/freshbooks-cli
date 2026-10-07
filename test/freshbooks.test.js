@@ -580,6 +580,131 @@ test("logTimer pauses a running timer before logging its timer resource", async 
   assert.equal(logged.results[0].durationSeconds, 7260);
 });
 
+test("logTimer rejects a response that retains an unlogged timer segment", async () => {
+  const entries = [segment({
+    duration: 60,
+    note: "",
+    timer: { id: 901, is_running: false },
+  })];
+  const client = { async request(path, options = {}) {
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
+    if (path === "/comments/business/123/project/44") {
+      return {
+        project: { id: 44, active: true, complete: false, services: [{ id: 66, billable: true }] },
+        abilities: [{ name: "can_track_time", value: true }],
+      };
+    }
+    if (path === "/comments/business/123/timers/901" && options.method === "PUT") {
+      return { timer: { time_entries: entries } };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore, now }).withTracking(trackingContext());
+
+  await assert.rejects(
+    service.logTimer(901, { guard: await currentTimerGuard(service) }),
+    error => error.code === "MUTATION_OUTCOME_UNKNOWN"
+      && error.outcomeUnknown === true
+      && error.details.mutationKind === "timer-log"
+      && error.details.cause.code === "UNCONFIRMED_TIMER_LOG",
+  );
+});
+
+test("switchTimer does not start the next timer after an unconfirmed log response", async () => {
+  const entries = [segment({
+    duration: 60,
+    note: "",
+    timer: { id: 901, is_running: false },
+  })];
+  let starts = 0;
+  const client = { async request(path, options = {}) {
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
+    if (path === "/comments/business/123/project/99") {
+      return {
+        project: { id: 99, active: true, complete: false, services: [{ id: 77, billable: false }] },
+        abilities: [{ name: "can_track_time", value: true }],
+      };
+    }
+    if (path === "/comments/business/123/timers/901" && options.method === "PUT") {
+      return { timer: { time_entries: entries } };
+    }
+    if (path === "/comments/business/123/time_entries" && options.method === "POST") {
+      starts += 1;
+      throw new Error("Next timer must not start");
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore, now }).withTracking(trackingContext());
+
+  await assert.rejects(
+    service.switchTimer(
+      901,
+      { project_id: 99, service_id: 77, note: "" },
+      { guard: await currentTimerGuard(service) },
+    ),
+    error => error.code === "MUTATION_OUTCOME_UNKNOWN"
+      && error.outcomeUnknown === true
+      && error.details.mutationKind === "timer-switch",
+  );
+  assert.equal(starts, 0);
+});
+
+test("logTimer selects the confirmed aggregate instead of an unrelated last entry", async () => {
+  const entries = [
+    segment({
+      id: 899,
+      is_logged: true,
+      duration: 120,
+      note: "",
+      started_at: "2026-09-01T14:57:00Z",
+      timer: { id: 901, is_running: false },
+    }),
+    segment({
+      id: 900,
+      duration: 60,
+      note: "",
+      timer: { id: 901, is_running: false },
+    }),
+  ];
+  const client = { async request(path, options = {}) {
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
+    if (path === "/comments/business/123/project/44") {
+      return {
+        project: { id: 44, active: true, complete: false, services: [{ id: 66, billable: true }] },
+        abilities: [{ name: "can_track_time", value: true }],
+      };
+    }
+    if (path === "/comments/business/123/timers/901" && options.method === "PUT") {
+      return { timer: { time_entries: [{
+        id: 903,
+        is_logged: true,
+        duration: 180,
+        started_at: "2026-09-01T14:57:00Z",
+        project_id: 44,
+        client_id: 55,
+        service_id: 66,
+        note: "",
+        billable: true,
+        billed: false,
+      }, {
+        id: 999,
+        is_logged: true,
+        duration: 1,
+        started_at: "2020-01-01T00:00:00Z",
+      }] } };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore, now }).withTracking(trackingContext());
+
+  const result = await service.logTimer(901, { guard: await currentTimerGuard(service) });
+
+  assert.equal(result.results[0].id, "903");
+  assert.equal(result.results[0].durationSeconds, 180);
+  assert.equal(result.results[1].kind, "active-timer");
+  assert.equal(result.results[1].exists, false);
+});
+
 test("timer start returns assigned receipt", async () => {
   let entries = [];
   const client = { async request(path, options = {}) {

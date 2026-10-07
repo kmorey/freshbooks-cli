@@ -621,14 +621,14 @@ export class FreshBooksService {
     const paused = timer.running;
     const stoppedTimer = paused ? await this.pauseTimerState(timer) : timer;
     try {
-      return await this.logTimerState(stoppedTimer, before);
+      return await this.logTimerState(stoppedTimer, before, mutationKind);
     } catch (error) {
       if (paused) throw ambiguousMutation(error, mutationKind);
       throw error;
     }
   }
 
-  async logTimerState(timer, before) {
+  async logTimerState(timer, before, mutationKind) {
     const businessId = await this.businessId();
     const payload = await this.client.request(`/comments/business/${businessId}/timers/${timer.id}`, {
       method: "PUT",
@@ -638,11 +638,13 @@ export class FreshBooksService {
         },
       },
     });
-    const logged = payload?.time_entry
-      || payload?.timer?.time_entry
-      || payload?.timer?.time_entries?.at(-1)
-      || payload?.time_entries?.at(-1)
-      || payload;
+    const logged = confirmedTimerLogEntry(payload, timer);
+    if (!logged) {
+      throw ambiguousMutation(new CliError(
+        "FreshBooks did not confirm that every timer segment was logged",
+        { code: "UNCONFIRMED_TIMER_LOG" },
+      ), mutationKind);
+    }
     const context = this.requireTracking();
     const confirmed = context.remember(canonicalTimeEntry(logged, { timezone: context.timezone }));
     const deleted = canonicalDeleted("active-timer", timer.id);
@@ -869,6 +871,68 @@ export function writableTimeEntry(entry) {
     "duration",
   ];
   return Object.fromEntries(fields.filter((field) => entry[field] !== undefined).map((field) => [field, entry[field]]));
+}
+
+function confirmedTimerLogEntry(payload, timer) {
+  const entries = timerLogResponseEntries(payload);
+  if (entries.length === 0 || entries.some((entry) => entry?.is_logged !== true)) return null;
+
+  const expectedDuration = timer._continuedSegments
+    .concat(timer._segments)
+    .reduce((total, segment) => total + Math.max(0, Number(segment.duration) || 0), 0);
+  const matching = entries.filter((entry) => {
+    if (entry?.id == null
+      || Number(entry.duration) !== expectedDuration
+      || Number.isNaN(new Date(entry.started_at).getTime())) {
+      return false;
+    }
+    const responseTimerId = entry.timer?.id ?? entry.timer_id;
+    if (responseTimerId != null && String(responseTimerId) !== String(timer.id)) return false;
+    for (const [field, expected] of [
+      ["project_id", timer.projectId],
+      ["client_id", timer.clientId],
+      ["service_id", timer.serviceId],
+    ]) {
+      if (entry[field] !== undefined
+        && expected != null
+        && String(entry[field]) !== String(expected)) return false;
+    }
+    return (entry.note === undefined || timer.note == null || entry.note === timer.note)
+      && (entry.billable === undefined || timer.billable == null || entry.billable === timer.billable);
+  });
+  return matching.length === 1 ? matching[0] : null;
+}
+
+function timerLogResponseEntries(payload) {
+  const entries = [];
+  const seen = new Set();
+  const add = (entry) => {
+    if (!entry || typeof entry !== "object" || seen.has(entry)) return;
+    seen.add(entry);
+    entries.push(entry);
+  };
+  const addList = (list) => {
+    if (!Array.isArray(list)) return;
+    for (const entry of list) add(entry);
+  };
+  const addRoot = (root) => {
+    if (!root || typeof root !== "object") return;
+    add(root.time_entry);
+    add(root.timeEntry);
+    addList(root.time_entries);
+    addList(root.timeEntries);
+    add(root.timer?.time_entry);
+    add(root.timer?.timeEntry);
+    addList(root.timer?.time_entries);
+    addList(root.timer?.timeEntries);
+  };
+
+  addRoot(payload);
+  addRoot(payload?.result);
+  addRoot(payload?.response);
+  addRoot(payload?.response?.result);
+  if (entries.length === 0 && payload?.id != null) add(payload);
+  return entries;
 }
 
 export function timerEntryFields(entry) {
