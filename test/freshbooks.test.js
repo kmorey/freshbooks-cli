@@ -331,6 +331,54 @@ test("update receipt carries before and after tokens", async () => {
   assert.equal(result.results[0], result.changes[0].after.record);
 });
 
+test("same-assignment update submits replacement-safe assignment metadata", async () => {
+  const existing = {
+    id: 9,
+    is_logged: true,
+    duration: 60,
+    started_at: "2026-09-02T12:00:00Z",
+    project_id: 44,
+    client_id: 55,
+    service_id: 66,
+    note: "Before",
+    billable: true,
+    billed: false,
+    active: true,
+  };
+  let submitted;
+  const client = { async request(path, options = {}) {
+    if (path.endsWith("/time_entries/9") && !options.method) {
+      return { time_entry: existing };
+    }
+    if (path === "/comments/business/123/project/44") return continuationProject();
+    if (path.endsWith("/time_entries/9") && options.method === "PUT") {
+      submitted = options.body.time_entry;
+      return {
+        time_entry: {
+          ...submitted,
+          id: 9,
+          client_id: submitted.client_id ?? null,
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const context = trackingContext();
+  const before = canonicalTimeEntry(existing, { timezone: context.timezone });
+  const service = new FreshBooksService({ client, configStore }).withTracking(context);
+
+  const updated = await service.updateTimeEntry(
+    9,
+    { project_id: 44, service_id: 66, note: "After" },
+    { guard: before.token },
+  );
+
+  assert.equal(submitted.client_id, 55);
+  assert.equal(submitted.billable, true);
+  assert.equal(submitted.internal, false);
+  assert.equal(updated.results[0].clientId, "55");
+});
+
 test("logged entries derive client and billability from the selected project service", async () => {
   let written;
   const client = { async request(path, options = {}) {
@@ -562,6 +610,11 @@ test("logTimer pauses a running timer before logging its timer resource", async 
         billed: false,
       }] } };
     }
+    if (path === "/timetracking/business/123/time_entries/899" && !options.method) {
+      const error = new Error("Not found");
+      error.status = 404;
+      throw error;
+    }
     throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
   } };
   const service = new FreshBooksService({ client, configStore, now }).withTracking(trackingContext());
@@ -693,6 +746,11 @@ test("logTimer selects the confirmed aggregate instead of an unrelated last entr
         started_at: "2020-01-01T00:00:00Z",
       }] } };
     }
+    if (path === "/timetracking/business/123/time_entries/899" && !options.method) {
+      const error = new Error("Not found");
+      error.status = 404;
+      throw error;
+    }
     throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
   } };
   const service = new FreshBooksService({ client, configStore, now }).withTracking(trackingContext());
@@ -701,8 +759,11 @@ test("logTimer selects the confirmed aggregate instead of an unrelated last entr
 
   assert.equal(result.results[0].id, "903");
   assert.equal(result.results[0].durationSeconds, 180);
-  assert.equal(result.results[1].kind, "active-timer");
+  assert.equal(result.results[1].kind, "time-entry");
   assert.equal(result.results[1].exists, false);
+  assert.equal(result.results[1].id, "899");
+  assert.equal(result.results[2].kind, "active-timer");
+  assert.equal(result.results[2].exists, false);
 });
 
 test("timer start returns assigned receipt", async () => {
@@ -1312,4 +1373,728 @@ test("timer start reports missing project before reading tracking configuration"
     code: "PROJECT_REQUIRED",
     message: "Starting a timer requires a project",
   });
+});
+
+function savedContinuationEntry(overrides = {}) {
+  return segment({
+    id: 25,
+    is_logged: true,
+    duration: 600,
+    started_at: "2026-09-01T14:00:00Z",
+    local_started_at: "2026-09-01T09:00:00",
+    pending_client: "Synthetic client",
+    pending_project: "Synthetic project",
+    pending_task: "Synthetic task",
+    task_id: 77,
+    source: "calendar",
+    active: true,
+    timer: undefined,
+    ...overrides,
+  });
+}
+
+function continuationGuard(entry) {
+  return canonicalTimeEntry(entry, { timezone: "America/Chicago" }).token;
+}
+
+function persistentConfig(initial = {}) {
+  let value = {
+    businessId,
+    timezone: "America/Chicago",
+    ...initial,
+  };
+  return {
+    async read() { return structuredClone(value); },
+    async update(patch) {
+      value = { ...value, ...structuredClone(patch) };
+      for (const key of Object.keys(value)) {
+        if (value[key] === undefined) delete value[key];
+      }
+      return structuredClone(value);
+    },
+    value() { return structuredClone(value); },
+  };
+}
+
+function continuationProject() {
+  return {
+    project: {
+      id: 44,
+      client_id: 55,
+      active: true,
+      complete: false,
+      services: [{ id: 66, billable: true }],
+    },
+    abilities: [{ name: "can_track_time", value: true }],
+  };
+}
+
+test("continuation uses a fresh native timer and persists logical source linkage", async () => {
+  const source = savedContinuationEntry({ timer: { id: 54825456, is_running: false } });
+  const store = persistentConfig();
+  let entries = [source];
+  const writes = [];
+  const client = { async request(path, options = {}) {
+    if (options.method) writes.push({ path, ...options });
+    if (path === "/timetracking/business/123/time_entries/25" && !options.method) {
+      return { time_entry: source };
+    }
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
+    if (path === "/comments/business/123/project/44") return continuationProject();
+    if (path === "/comments/business/123/time_entries" && options.method === "POST") {
+      return { time_entry: { id: 700, timer: { id: 701 } } };
+    }
+    if (path === "/comments/business/123/time_entries/700" && options.method === "PUT") {
+      const open = { id: 700, ...options.body.time_entry, timer: { id: 701, is_running: true } };
+      entries.push(open);
+      return { time_entry: open };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+
+  const first = new FreshBooksService({ client, configStore: store, now })
+    .withTracking(trackingContext());
+  const continued = await first.continueTimerEntry(25, {
+    entryGuard: continuationGuard(source),
+  });
+
+  assert.equal(continued.results[0].id, "701");
+  assert.equal(continued.results[0].elapsedAnchor.closedSeconds, 600);
+  assert.deepEqual(store.value().timerContinuations, {
+    "123": {
+      "701": {
+        sourceEntryId: "25",
+        sourceToken: continuationGuard(source),
+        finalization: null,
+      },
+    },
+  });
+  assert.equal(writes.some(({ path }) => path.endsWith("/25")), false);
+  assert.equal(writes.some(({ body }) =>
+    String(body?.time_entry?.timer?.id) === "54825456"), false);
+
+  const second = new FreshBooksService({ client, configStore: store, now })
+    .withTracking(trackingContext());
+  const status = await second.timerStatusObservation();
+  assert.equal(status.records[0].id, "701");
+  assert.equal(status.records[0].elapsedAnchor.closedSeconds, 600);
+  assert.deepEqual(status.records[0].segments.map(({ id, logged }) => [id, logged]), [
+    ["25", true],
+    ["700", false],
+  ]);
+});
+
+test("inactive partial continuation does not block status or an unrelated fresh start", async () => {
+  const finalization = {
+    phase: "updating-source",
+    expectedNativeSeconds: 9600,
+    nativeSegmentIds: ["700"],
+    loggedEntryId: "800",
+    loggedSeconds: 9600,
+    sourceDurationSeconds: 7860,
+    targetDurationSeconds: 17460,
+  };
+  const retainedLink = {
+    sourceEntryId: "25",
+    sourceToken: "retained-source-token",
+    finalization,
+  };
+  const store = persistentConfig({
+    timerContinuations: { "123": { "701": retainedLink } },
+  });
+  let entries = [];
+  let sourceReads = 0;
+  const writes = [];
+  const client = { async request(path, options = {}) {
+    if (options.method) writes.push({ path, ...options });
+    if (path === "/timetracking/business/123/time_entries") {
+      return { time_entries: entries };
+    }
+    if (path.endsWith("/time_entries/25") && !options.method) {
+      sourceReads += 1;
+      return { time_entry: { ...savedContinuationEntry(), active: false } };
+    }
+    if (path === "/auth/api/v1/users/me") return { response: { id: 88 } };
+    if (path === "/comments/business/123/project/98") {
+      const error = new Error("Project is unavailable");
+      error.status = 422;
+      error.outcomeUnknown = false;
+      throw error;
+    }
+    if (path === "/comments/business/123/project/44") return continuationProject();
+    if (path === "/comments/business/123/time_entries" && options.method === "POST") {
+      return { time_entry: { id: 900, timer: { id: 901 } } };
+    }
+    if (path.endsWith("/comments/business/123/time_entries/900")
+      && options.method === "PUT") {
+      const assigned = {
+        id: 900,
+        ...options.body.time_entry,
+        timer: { id: 901, is_running: true },
+      };
+      entries = [assigned];
+      return { time_entry: assigned };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+
+  const statusService = new FreshBooksService({ client, configStore: store, now })
+    .withTracking(trackingContext());
+  const status = await statusService.timerStatusObservation();
+  assert.deepEqual(status.records, []);
+  assert.equal(sourceReads, 0);
+
+  const failedStart = new FreshBooksService({ client, configStore: store, now })
+    .withTracking(trackingContext());
+  await assert.rejects(
+    failedStart.startTimer({ project_id: 98, service_id: 66 }),
+    error => error.status === 422 && error.outcomeUnknown === false,
+  );
+  assert.equal(writes.length, 0);
+
+  const startService = new FreshBooksService({ client, configStore: store, now })
+    .withTracking(trackingContext());
+  const started = await startService.startTimer({ project_id: 44, service_id: 66 });
+  assert.equal(started.results[0].id, "901");
+  assert.deepEqual(store.value().timerContinuations["123"]["701"], retainedLink);
+  assert.equal(sourceReads, 0);
+
+  const writesBeforeRefusal = writes.length;
+  const affected = new FreshBooksService({ client, configStore: store, now })
+    .withTracking(trackingContext());
+  await assert.rejects(
+    affected.pauseTimer(701, { guard: "stale-active-timer-token" }),
+    error => error.code === "CONTINUATION_FINALIZATION_PARTIAL"
+      && error.outcomeUnknown === true
+      && error.details.timerId === "701"
+      && error.details.finalization.phase === "updating-source",
+  );
+  assert.equal(writes.length, writesBeforeRefusal);
+  assert.deepEqual(store.value().timerContinuations["123"]["701"], retainedLink);
+
+  entries = [segment({ id: 700, timer: { id: 701, is_running: false }, duration: 60 })];
+  await assert.rejects(
+    failedStart.startTimer({ project_id: 44, service_id: 66 }),
+    error => error.code === "CONTINUATION_FINALIZATION_PARTIAL"
+      && error.outcomeUnknown === false && error.details.timerId === "701",
+  );
+  assert.equal(writes.length, writesBeforeRefusal);
+  assert.deepEqual(store.value().timerContinuations["123"]["701"], retainedLink);
+});
+
+test("continuation source guard is re-read and rejects source billing changes", async () => {
+  const source = savedContinuationEntry();
+  const changed = { ...source, billed: true };
+  const store = persistentConfig({
+    timerContinuations: {
+      "123": {
+        "701": {
+          sourceEntryId: "25",
+          sourceToken: continuationGuard(source),
+          finalization: null,
+        },
+      },
+    },
+  });
+  const native = segment({ id: 700, timer: { id: 701, is_running: true } });
+  let writes = 0;
+  const client = { async request(path, options = {}) {
+    if (options.method) writes += 1;
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: [native] };
+    if (path.endsWith("/time_entries/25")) return { time_entry: changed };
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore: store, now })
+    .withTracking(trackingContext());
+
+  await assert.rejects(service.timerStatusObservation(), {
+    code: "CONTINUATION_ENTRY_CHANGED",
+  });
+  assert.equal(writes, 0);
+});
+
+test("pause resume correction and discard mutate only native continuation segments", async () => {
+  const source = savedContinuationEntry();
+  const store = persistentConfig({
+    timerContinuations: {
+      "123": {
+        "701": {
+          sourceEntryId: "25",
+          sourceToken: continuationGuard(source),
+          finalization: null,
+        },
+      },
+    },
+  });
+  let entries = [
+    segment({ id: 700, timer: { id: 701, is_running: true } }),
+  ];
+  let nextId = 702;
+  const writes = [];
+  const client = { async request(path, options = {}) {
+    if (options.method) writes.push({ path, ...options });
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
+    if (path.endsWith("/time_entries/25") && !options.method) return { time_entry: source };
+    if (path === "/comments/business/123/time_entries" && options.method === "POST") {
+      const created = {
+        ...options.body.time_entry,
+        id: nextId++,
+        timer: { id: 701, is_running: true },
+      };
+      entries.push(created);
+      return { time_entry: created };
+    }
+    if (path.startsWith("/comments/business/123/time_entries/") && options.method === "PUT") {
+      const id = Number(path.split("/").at(-1));
+      entries = entries.map((entry) => entry.id === id
+        ? { ...entry, ...options.body.time_entry, timer: { id: 701, is_running: false } }
+        : entry);
+      return { time_entry: entries.find((entry) => entry.id === id) };
+    }
+    if (path.startsWith("/timetracking/business/123/time_entries/") && options.method === "DELETE") {
+      const id = Number(path.split("/").at(-1));
+      entries = entries.filter((entry) => entry.id !== id);
+      return {};
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore: store, now })
+    .withTracking(trackingContext());
+  let guard = await currentTimerGuard(service, 701);
+  const paused = await service.pauseTimer(701, { guard });
+  guard = paused.results[0].token;
+  const resumed = await service.resumeTimer(701, { guard });
+  guard = resumed.results[0].token;
+  const corrected = await service.correctTimer(701, 720, { guard });
+  await service.discardTimer(701, { guard: corrected.results[0].token });
+
+  assert.equal(writes.some(({ path }) => path.endsWith("/25")), false);
+  assert.equal(store.value().timerContinuations, undefined);
+  assert.equal(source.duration, 600);
+  assert.equal(source.is_logged, true);
+});
+
+for (const scenario of [
+  { phase: "logging-native", running: false, unknown: false, durablePhase: null, sourceSeconds: 600, native: true, intermediate: false },
+  { phase: "logging-native", running: true, unknown: true, durablePhase: null, sourceSeconds: 600, native: true, intermediate: false },
+  { phase: "native-logged", running: false, unknown: true, durablePhase: "logging-native", sourceSeconds: 600, native: false, intermediate: true },
+  { phase: "updating-source", running: false, unknown: true, durablePhase: "native-logged", sourceSeconds: 600, native: false, intermediate: true },
+  { phase: "deleting-intermediate", running: false, unknown: true, durablePhase: "updating-source", sourceSeconds: 660, native: false, intermediate: true },
+  { phase: "clearing-link", running: false, unknown: true, durablePhase: "deleting-intermediate", sourceSeconds: 660, native: false, intermediate: false },
+]) {
+  test(`continuation config failure at ${scenario.phase} from ${scenario.running ? "running" : "paused"} preserves partial outcomes`, async () => {
+    let source = savedContinuationEntry();
+    const store = persistentConfig({
+      timerContinuations: { "123": { "701": {
+        sourceEntryId: "25",
+        sourceToken: continuationGuard(source),
+        finalization: null,
+      } } },
+    });
+    const persist = store.update;
+    const failure = Object.assign(new Error("Synthetic config write failure"), { code: "EACCES" });
+    store.update = async patch => {
+      const phase = patch.timerContinuations?.["123"]?.["701"]?.finalization?.phase || "clearing-link";
+      if (phase === scenario.phase) throw failure;
+      return persist(patch);
+    };
+    let native = segment({
+      id: 700, duration: scenario.running ? null : 60,
+      timer: { id: 701, is_running: scenario.running },
+    });
+    let intermediate = null;
+    const client = { async request(path, options = {}) {
+      if (path === "/timetracking/business/123/time_entries")
+        return { time_entries: native ? [native] : intermediate ? [intermediate] : [] };
+      if (path.endsWith("/time_entries/25") && !options.method) return { time_entry: source };
+      if (path === "/comments/business/123/project/44") return continuationProject();
+      if (path === "/comments/business/123/time_entries/700" && options.method === "PUT") {
+        native = { ...native, ...options.body.time_entry, timer: { id: 701, is_running: false } };
+        return { time_entry: native };
+      }
+      if (path === "/comments/business/123/timers/701" && options.method === "PUT") {
+        intermediate = { ...native, id: 800, is_logged: true, duration: 60 };
+        native = null;
+        return { time_entry: intermediate };
+      }
+      if (path.endsWith("/time_entries/25") && options.method === "PUT") {
+        source = { ...options.body.time_entry, id: 25 };
+        return { time_entry: source };
+      }
+      if (path.endsWith("/time_entries/800") && options.method === "DELETE") {
+        intermediate = null;
+        return {};
+      }
+      throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+    } };
+    const service = new FreshBooksService({ client, configStore: store, now })
+      .withTracking(trackingContext());
+    const guard = await currentTimerGuard(service, 701);
+    await assert.rejects(service.logTimer(701, { guard }), error => {
+      assert.equal(error.outcomeUnknown === true, scenario.unknown);
+      if (scenario.unknown) {
+        assert.equal(error.code, "CONTINUATION_FINALIZATION_PARTIAL");
+        assert.equal(error.details.phase, scenario.phase);
+        assert.equal(error.details.cause.code, "EACCES");
+      } else assert.equal(error, failure);
+      return true;
+    });
+    assert.equal(source.duration, scenario.sourceSeconds);
+    assert.equal(native !== null, scenario.native);
+    assert.equal(intermediate !== null, scenario.intermediate);
+    if (native) assert.equal(native.timer.is_running, false);
+    if (intermediate) assert.equal(intermediate.duration, 60);
+    assert.equal(store.value().timerContinuations["123"]["701"].finalization?.phase ?? null,
+      scenario.durablePhase);
+  });
+}
+
+test("final save folds rounded native delta into the stable source and deletes intermediate", async () => {
+  let source = savedContinuationEntry();
+  const store = persistentConfig({
+    timerContinuations: {
+      "123": {
+        "701": {
+          sourceEntryId: "25",
+          sourceToken: continuationGuard(source),
+          finalization: null,
+        },
+      },
+    },
+  });
+  let native = segment({
+    id: 700,
+    started_at: "2026-09-01T14:58:48Z",
+    timer: { id: 701, is_running: true },
+  });
+  let intermediate = null;
+  const writes = [];
+  const client = { async request(path, options = {}) {
+    if (options.method) writes.push({ path, ...options });
+    if (path === "/timetracking/business/123/time_entries") {
+      return { time_entries: native ? [native] : intermediate ? [intermediate] : [] };
+    }
+    if (path.endsWith("/time_entries/25") && !options.method) return { time_entry: source };
+    if (path === "/comments/business/123/project/44") return continuationProject();
+    if (path.endsWith("/comments/business/123/time_entries/700") && options.method === "PUT") {
+      native = { ...native, ...options.body.time_entry, timer: { id: 701, is_running: false } };
+      return { time_entry: native };
+    }
+    if (path === "/comments/business/123/timers/701" && options.method === "PUT") {
+      intermediate = {
+        ...native,
+        id: 800,
+        is_logged: true,
+        duration: 60,
+        timer: { id: 701, is_running: false },
+      };
+      native = null;
+      return { time_entry: intermediate };
+    }
+    if (path.endsWith("/time_entries/25") && options.method === "PUT") {
+      source = {
+        ...options.body.time_entry,
+        id: 25,
+        client_id: options.body.time_entry.client_id ?? null,
+      };
+      return { time_entry: source };
+    }
+    if (path.endsWith("/time_entries/800") && options.method === "DELETE") {
+      intermediate = null;
+      return {};
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore: store, now })
+    .withTracking(trackingContext());
+  const logged = await service.logTimer(701, {
+    guard: await currentTimerGuard(service, 701),
+  });
+
+  assert.equal(source.id, 25);
+  assert.equal(source.duration, 660);
+  assert.equal(source.client_id, 55);
+  assert.equal(source.billable, true);
+  assert.equal(source.internal, false);
+  assert.equal(intermediate, null);
+  assert.equal(logged.results[0].id, "25");
+  assert.equal(logged.results[0].durationSeconds, 660);
+  assert.equal(logged.phase, null);
+  assert.equal(store.value().timerContinuations, undefined);
+  assert.equal(writes.filter(({ path }) => path.includes("/timers/701")).length, 1);
+});
+
+test("user-deleted source during native log is never resurrected and retains partial proof", async () => {
+  let source = savedContinuationEntry();
+  const store = persistentConfig({
+    timerContinuations: {
+      "123": {
+        "701": {
+          sourceEntryId: "25",
+          sourceToken: continuationGuard(source),
+          finalization: null,
+        },
+      },
+    },
+  });
+  let native = segment({
+    id: 700,
+    duration: 72,
+    timer: { id: 701, is_running: false },
+  });
+  let logWrites = 0;
+  let sourceWrites = 0;
+  let intermediateDeletes = 0;
+  const client = { async request(path, options = {}) {
+    if (path === "/timetracking/business/123/time_entries") {
+      return { time_entries: native ? [native] : [] };
+    }
+    if (path.endsWith("/time_entries/25") && !options.method) return { time_entry: source };
+    if (path === "/comments/business/123/project/44") return continuationProject();
+    if (path === "/comments/business/123/timers/701" && options.method === "PUT") {
+      logWrites += 1;
+      native = null;
+      source = { ...source, active: false };
+      return { time_entry: {
+        ...segment(),
+        id: 800,
+        is_logged: true,
+        duration: 60,
+        timer: { id: 701, is_running: false },
+      } };
+    }
+    if (path.endsWith("/time_entries/25") && options.method === "PUT") {
+      sourceWrites += 1;
+      throw new Error("Source must not be overwritten");
+    }
+    if (path.endsWith("/time_entries/800") && options.method === "DELETE") {
+      intermediateDeletes += 1;
+      throw new Error("Intermediate must be retained for reconciliation");
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore: store, now })
+    .withTracking(trackingContext());
+  const guard = await currentTimerGuard(service, 701);
+
+  await assert.rejects(service.logTimer(701, { guard }), {
+    code: "CONTINUATION_FINALIZATION_PARTIAL",
+  });
+  assert.deepEqual(store.value().timerContinuations["123"]["701"].finalization, {
+    phase: "updating-source",
+    expectedNativeSeconds: 72,
+    nativeSegmentIds: ["700"],
+    loggedEntryId: "800",
+    loggedSeconds: 60,
+    sourceDurationSeconds: 600,
+    targetDurationSeconds: 660,
+  });
+  await assert.rejects(service.logTimer(701, { guard }));
+  assert.equal(logWrites, 1);
+  assert.equal(source.active, false);
+  assert.equal(source.duration, 600);
+  assert.equal(sourceWrites, 0);
+  assert.equal(intermediateDeletes, 0);
+});
+
+test("continuing an entry already backing the active timer performs no writes", async () => {
+  const source = savedContinuationEntry();
+  const store = persistentConfig({
+    timerContinuations: {
+      "123": {
+        "701": {
+          sourceEntryId: "25",
+          sourceToken: continuationGuard(source),
+          finalization: null,
+        },
+      },
+    },
+  });
+  const native = segment({ id: 700, timer: { id: 701, is_running: true } });
+  let writes = 0;
+  const client = { async request(path, options = {}) {
+    if (options.method) writes += 1;
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: [native] };
+    if (path.endsWith("/time_entries/25")) return { time_entry: source };
+    if (path === "/comments/business/123/project/44") return continuationProject();
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore: store, now })
+    .withTracking(trackingContext());
+  const guard = await currentTimerGuard(service, 701);
+
+  await assert.rejects(service.continueTimerEntry(25, {
+    entryGuard: continuationGuard(source),
+    timerId: 701,
+    guard,
+  }), { code: "CONTINUATION_TIMER_CHANGED" });
+  assert.equal(writes, 0);
+});
+
+test("switch paths finalize a continuation before starting the requested timer", async () => {
+  for (const mode of ["switch", "continue-other"]) {
+    let source = savedContinuationEntry();
+    const other = savedContinuationEntry({
+      id: 26,
+      project_id: 99,
+      client_id: 77,
+      service_id: 88,
+      note: "Other saved work",
+      timer: undefined,
+    });
+    const store = persistentConfig({
+      timerContinuations: {
+        "123": {
+          "701": {
+            sourceEntryId: "25",
+            sourceToken: continuationGuard(source),
+            finalization: null,
+          },
+        },
+      },
+    });
+    let native = segment({
+      id: 700,
+      duration: 60,
+      timer: { id: 701, is_running: false },
+    });
+    let intermediate = null;
+    let nextNative = null;
+    const client = { async request(path, options = {}) {
+      if (path === "/timetracking/business/123/time_entries") {
+        return { time_entries: native ? [native] : nextNative ? [nextNative] : [] };
+      }
+      if (path.endsWith("/time_entries/25") && !options.method) return { time_entry: source };
+      if (path.endsWith("/time_entries/26") && !options.method) return { time_entry: other };
+      if (path === "/comments/business/123/project/44") return continuationProject();
+      if (path === "/comments/business/123/project/99") return {
+        project: {
+          id: 99,
+          client_id: 77,
+          active: true,
+          complete: false,
+          services: [{ id: 88, billable: false }],
+        },
+        abilities: [{ name: "can_track_time", value: true }],
+      };
+      if (path === "/comments/business/123/timers/701" && options.method === "PUT") {
+        intermediate = {
+          ...native,
+          id: 800,
+          is_logged: true,
+          duration: 60,
+          timer: { id: 701, is_running: false },
+        };
+        native = null;
+        return { time_entry: intermediate };
+      }
+      if (path.endsWith("/time_entries/25") && options.method === "PUT") {
+        source = {
+          ...options.body.time_entry,
+          id: 25,
+          client_id: options.body.time_entry.client_id ?? null,
+        };
+        return { time_entry: source };
+      }
+      if (path.endsWith("/time_entries/800") && options.method === "DELETE") {
+        intermediate = null;
+        return {};
+      }
+      if (path === "/comments/business/123/time_entries" && options.method === "POST") {
+        return { time_entry: { id: 900, timer: { id: 901 } } };
+      }
+      if (path.endsWith("/comments/business/123/time_entries/900")
+        && options.method === "PUT") {
+        nextNative = {
+          id: 900,
+          ...options.body.time_entry,
+          timer: { id: 901, is_running: true },
+        };
+        return { time_entry: nextNative };
+      }
+      throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+    } };
+    const service = new FreshBooksService({ client, configStore: store, now })
+      .withTracking(trackingContext());
+    const guard = await currentTimerGuard(service, 701);
+    const result = mode === "switch"
+      ? await service.switchTimer(
+        701,
+        { project_id: 99, service_id: 88, note: "Next task" },
+        { guard },
+      )
+      : await service.continueTimerEntry(26, {
+        entryGuard: continuationGuard(other),
+        timerId: 701,
+        guard,
+      });
+
+    assert.deepEqual(result.phase, { log: "confirmed", start: "confirmed" }, mode);
+    assert.equal(source.id, 25, mode);
+    assert.equal(source.duration, 660, mode);
+    assert.equal(intermediate, null, mode);
+    assert.equal(nextNative.timer.id, 901, mode);
+    if (mode === "switch") {
+      assert.equal(store.value().timerContinuations, undefined);
+    } else {
+      assert.equal(
+        store.value().timerContinuations["123"]["901"].sourceEntryId,
+        "26",
+      );
+    }
+  }
+});
+
+test("definitive first-write rejection does not create unknown continuation state", async () => {
+  const source = savedContinuationEntry();
+  const store = persistentConfig();
+  const client = { async request(path, options = {}) {
+    if (path.endsWith("/time_entries/25")) return { time_entry: source };
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: [] };
+    if (path === "/comments/business/123/project/44") return continuationProject();
+    if (path === "/comments/business/123/time_entries" && options.method === "POST") {
+      const error = new Error("You may not resume a logged timer.");
+      error.status = 422;
+      error.outcomeUnknown = false;
+      throw error;
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore: store, now })
+    .withTracking(trackingContext());
+
+  await assert.rejects(
+    service.continueTimerEntry(25, { entryGuard: continuationGuard(source) }),
+    error => error.status === 422 && error.outcomeUnknown === false,
+  );
+  assert.equal(store.value().timerContinuations, undefined);
+});
+
+
+test("timer log rejects a saved aggregate outside exact or nearest-minute duration", async () => {
+  const entries = [segment({
+    duration: 72,
+    timer: { id: 901, is_running: false },
+  })];
+  const client = { async request(path, options = {}) {
+    if (path === "/timetracking/business/123/time_entries") return { time_entries: entries };
+    if (path === "/comments/business/123/project/44") return continuationProject();
+    if (path === "/comments/business/123/timers/901" && options.method === "PUT") {
+      return { time_entry: {
+        ...entries[0],
+        id: 999,
+        is_logged: true,
+        duration: 120,
+      } };
+    }
+    throw new Error(`Unexpected request: ${options.method || "GET"} ${path}`);
+  } };
+  const service = new FreshBooksService({ client, configStore, now })
+    .withTracking(trackingContext());
+
+  await assert.rejects(
+    service.logTimer(901, { guard: await currentTimerGuard(service) }),
+    error => error.code === "MUTATION_OUTCOME_UNKNOWN"
+      && error.details.cause.code === "UNCONFIRMED_TIMER_LOG",
+  );
 });

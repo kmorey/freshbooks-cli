@@ -249,7 +249,7 @@ async function diagnosticsCommand({ action, output, configStore, secretStore }) 
     capabilities: [
       "clients", "projects", "time-entries", "timer-segments", "timer-switch", "popup-onboarding",
       "semantic-guards", "local-calendar", "bounded-history", "canonical-tracking-v2",
-      "mutation-receipts",
+      "mutation-receipts", "timer-continuation",
     ],
   };
   output.success(result, `freshbooks ${PACKAGE_VERSION}: ${result.authenticated ? "authenticated" : "not authenticated"}`);
@@ -295,6 +295,33 @@ async function timerCommand({ action, argument, options, output, service, bindTr
     const result = await service.startTimer(fields, { force: options.force });
     const timer = receiptResult(result, "active-timer");
     output.success(result, `Started FreshBooks timer #${timer.id}.`);
+    return 0;
+  }
+  if (action === "continue") {
+    const entryId = optionalInteger(options.entry, "entry");
+    if (!entryId) {
+      throw new CliError("Continuing time requires --entry", {
+        code: "INVALID_ARGUMENT",
+        exitCode: 2,
+      });
+    }
+    const entryGuard = requireOption(options, "entryGuard", "entry-guard");
+    const hasCurrentId = options.id !== undefined;
+    const hasCurrentGuard = options.guard !== undefined;
+    if (hasCurrentId !== hasCurrentGuard) {
+      throw new CliError("Continuing with an active timer requires both --id and --guard", {
+        code: "INVALID_ARGUMENT",
+        exitCode: 2,
+      });
+    }
+    service = await bindTracking();
+    const result = await service.continueTimerEntry(entryId, {
+      entryGuard,
+      timerId,
+      guard: options.guard,
+    });
+    const timer = receiptResult(result, "active-timer");
+    output.success(result, `Continued FreshBooks entry #${entryId} with timer #${timer.id}.`);
     return 0;
   }
   if (action === "log") {
@@ -573,6 +600,7 @@ Usage:
   freshbooks diagnostics status
   freshbooks timer status
   freshbooks timer start --project ID --service ID [--note TEXT]
+  freshbooks timer continue --entry ENTRY_ID --entry-guard TOKEN [--id TIMER_ID --guard TOKEN]
   freshbooks timer pause --id TIMER_ID --guard TOKEN
   freshbooks timer resume --id TIMER_ID --guard TOKEN
   freshbooks timer correct --duration SECONDS --id TIMER_ID --guard TOKEN

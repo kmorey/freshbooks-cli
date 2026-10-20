@@ -236,10 +236,7 @@ export class FreshBooksService {
       assertTrackableProject(project, service, abilities);
       entry = {
         ...entry,
-        client_id: project.client_id ?? null,
-        service_id: service.id,
-        billable: project.internal === true ? false : service.billable === true,
-        internal: project.internal === true,
+        ...timeEntryAssignment(project, service),
       };
     }
     const payload = await this.client.request(`/timetracking/business/${businessId}/time_entries`, {
@@ -259,11 +256,22 @@ export class FreshBooksService {
 
   async updateTimeEntry(entryId, patch, { guard } = {}) {
     const { existing, current: before } = await this.guardedTimeEntry(entryId, guard);
-    const entry = Object.assign(writableTimeEntry(existing), compact(patch));
+    let entry = Object.assign(writableTimeEntry(existing), compact(patch));
     if (patch.project_id !== undefined || patch.service_id !== undefined) {
-      delete entry.client_id;
-      delete entry.billable;
-      delete entry.internal;
+      if (entry.project_id) {
+        const { project, abilities } = await this.timerProject(entry.project_id);
+        const service = selectProjectService(project, entry.service_id);
+        assertTrackableProject(project, service, abilities);
+        entry = { ...entry, ...timeEntryAssignment(project, service) };
+      } else {
+        entry = {
+          ...entry,
+          client_id: null,
+          service_id: null,
+          billable: false,
+          internal: false,
+        };
+      }
     }
     const businessId = await this.businessId();
     const payload = await this.client.request(
@@ -374,6 +382,12 @@ export class FreshBooksService {
   }
 
   async activeTimer(timerId) {
+    if (timerId !== undefined) {
+      const continuation = await this.continuationLink(timerId);
+      if (continuation?.finalization) {
+        throw continuationPartialState(timerId, continuation);
+      }
+    }
     const active = await this.activeTimers();
     if (timerId !== undefined) {
       const timer = active.find(
@@ -405,7 +419,49 @@ export class FreshBooksService {
       `/timetracking/business/${businessId}/time_entries`,
       { query: { include_unlogged: true, per_page: 100, page: 1 } },
     );
-    return payload?.time_entries || [];
+    const entries = (payload?.time_entries || []).slice();
+    const nativeTimerIds = new Set(entries
+      .filter((entry) => entry?.is_logged === false && entry?.timer?.id != null)
+      .map((entry) => String(entry.timer.id)));
+    const links = await this.continuationLinks(businessId);
+    for (const [timerId, link] of Object.entries(links)) {
+      // A durable continuation link can outlive its native timer. It remains
+      // recovery evidence, but must not poison discovery of unrelated timers.
+      if (!nativeTimerIds.has(timerId)) continue;
+      if (link.finalization) {
+        throw continuationPartialState(timerId, link, false);
+      }
+      let source;
+      try {
+        source = await this.timeEntry(link.sourceEntryId);
+      } catch (error) {
+        if (error?.status === 404) {
+          throw continuationEntryChanged(
+            link.sourceToken,
+            canonicalDeleted("time-entry", link.sourceEntryId),
+          );
+        }
+        throw error;
+      }
+      if (source?.active === false) {
+        throw continuationEntryChanged(
+          link.sourceToken,
+          canonicalDeleted("time-entry", link.sourceEntryId),
+        );
+      }
+      const current = canonicalTimeEntry(source, {
+        timezone: this.trackingContext?.timezone ?? (await this.configStore.read()).timezone,
+      });
+      if (current.token !== link.sourceToken || source.is_logged !== true || source.billed === true) {
+        throw continuationEntryChanged(link.sourceToken, current);
+      }
+      entries.push({
+        ...source,
+        timer: { id: Number(timerId), is_running: false },
+        _continuationSource: true,
+      });
+    }
+    return entries;
   }
 
   async startTimer(fields, { force = false } = {}) {
@@ -444,10 +500,7 @@ export class FreshBooksService {
     const startedAt = fields.started_at || this.now().toISOString();
     const common = timerEntryFields({
       ...fields,
-      client_id: project.client_id ?? null,
-      service_id: service?.id ?? fields.service_id ?? null,
-      billable: project.internal === true ? false : (service?.billable ?? fields.billable ?? false),
-      internal: project.internal === true,
+      ...timeEntryAssignment(project, service),
       is_logged: false,
       started_at: startedAt,
       local_started_at: fields.local_started_at ?? null,
@@ -493,6 +546,164 @@ export class FreshBooksService {
       throw ambiguousMutation(error, "timer-start");
     }
   }
+  async continueTimerEntry(entryId, {
+    entryGuard,
+    timerId,
+    guard,
+  } = {}) {
+    requireMutationGuard(entryGuard);
+    if ((timerId === undefined) !== (guard === undefined)) {
+      throw new CliError("Continuing with an active timer requires both its identity and guard", {
+        code: "INVALID_ARGUMENT",
+        exitCode: 2,
+      });
+    }
+
+    const { existing: source } = await this.continuationEntry(entryId, entryGuard);
+    if (source.is_logged !== true) {
+      throw new CliError("Only a saved time entry can be continued", {
+        code: "CONTINUATION_ENTRY_NOT_LOGGED",
+      });
+    }
+    if (source.billed === true) {
+      throw new CliError("A billed time entry cannot be continued", {
+        code: "CONTINUATION_ENTRY_BILLED",
+      });
+    }
+    if (!source.project_id) {
+      throw new CliError("The saved time entry has no project", {
+        code: "CONTINUATION_PROJECT_REQUIRED",
+      });
+    }
+
+    const [active, target, config] = await Promise.all([
+      this.activeTimers(),
+      this.timerProject(source.project_id),
+      this.configStore.read(),
+    ]);
+    const selectedService = selectProjectService(target.project, source.service_id);
+    assertTrackableProject(target.project, selectedService, target.abilities);
+    let oldTimer = null;
+    let oldBefore = null;
+    if (timerId === undefined) {
+      if (active.length > 0) {
+        throw continuationTimerChanged(timerId, null, active);
+      }
+    } else {
+      oldTimer = active.find((candidate) => candidate.id === timerId);
+      if (!oldTimer || active.length !== 1) {
+        throw continuationTimerChanged(timerId, guard, active);
+      }
+      oldBefore = this.currentTimerRecord(oldTimer);
+      if (guard !== oldBefore.token) {
+        throw continuationTimerChanged(timerId, guard, active, oldBefore);
+      }
+    }
+    if (oldTimer) {
+      const oldContinuation = await this.continuationLink(oldTimer.id);
+      const continuedSourceMatches = oldTimer._continuedSegments.some(
+        (segment) => String(segment.id) === String(entryId),
+      );
+      const sourceTimerId = source.timer?.id ?? source.timer_id;
+      const remoteTimerMatches = sourceTimerId != null
+        && String(sourceTimerId) === String(oldTimer.id);
+      if (String(oldContinuation?.sourceEntryId) === String(entryId)
+        || continuedSourceMatches
+        || remoteTimerMatches) {
+        throw new CliError("This saved entry is already the source of the active continuation", {
+          code: "CONTINUATION_TIMER_CHANGED",
+          details: {
+            entryId: String(entryId),
+            timerId: String(oldTimer.id),
+          },
+        });
+      }
+    }
+
+    if (oldTimer) {
+      const oldTarget = oldTimer.projectId === String(source.project_id)
+        || oldTimer.projectId === source.project_id
+        ? target
+        : await this.timerProject(oldTimer.projectId);
+      const oldService = selectProjectService(oldTarget.project, oldTimer.serviceId);
+      assertTrackableProject(oldTarget.project, oldService, oldTarget.abilities);
+    }
+
+
+    const identity = source.identity_id == null ? await this.identity() : { id: source.identity_id };
+    const start = () => this.startContinuationState(source, entryGuard, {
+      identity,
+      ...target,
+      timezone: config.timezone,
+    });
+    if (!oldTimer) return start();
+
+    const logged = await this.stopAndLogTimer(oldTimer, oldBefore, "timer-switch");
+    try {
+      const started = await start();
+      return receipt(
+        "timer-switch",
+        [...logged.changes, ...started.changes],
+        [...logged.results, ...started.results],
+        { log: "confirmed", start: "confirmed" },
+      );
+    } catch (error) {
+      const partialReceipt = receipt(
+        "timer-switch",
+        logged.changes,
+        logged.results,
+        { log: "confirmed", start: "failed" },
+      );
+      throw new CliError("The previous timer logged, but the saved entry did not continue", {
+        code: "TIMER_SWITCH_PARTIAL",
+        details: {
+          partialReceipt,
+          startError: {
+            code: error?.code || "UNEXPECTED_ERROR",
+            message: error instanceof Error ? error.message : String(error),
+          },
+        },
+      });
+    }
+  }
+
+  async startContinuationState(source, sourceToken, target) {
+    const started = await this.startTimerState({
+      ...timerEntryFields(source),
+      project_id: source.project_id,
+      service_id: source.service_id,
+      started_at: this.now().toISOString(),
+      local_started_at: null,
+    }, target);
+    const startedTimer = started.results.find((result) =>
+      result.kind === "active-timer" && result.exists === true);
+    if (!startedTimer) {
+      throw ambiguousMutation(new CliError("FreshBooks did not return the new timer", {
+        code: "TIMER_RECONCILIATION_FAILED",
+      }), "timer-start");
+    }
+
+    try {
+      const businessId = await this.businessId();
+      await this.writeContinuationLink(businessId, startedTimer.id, {
+        sourceEntryId: String(source.id),
+        sourceToken,
+        finalization: null,
+      });
+      const open = continuationOpenFromRecord(startedTimer, source);
+      const logicalSource = continuationSourceForTimer(source, startedTimer.id);
+      const timer = this.rememberTimerSegments([logicalSource, open], startedTimer.id);
+      const result = this.currentTimerRecord(timer);
+      return receipt("timer-start", [{
+        scope: recordScope(result),
+        before: { absent: true },
+        after: { record: result },
+      }], [result]);
+    } catch (error) {
+      throw ambiguousMutation(error, "timer-start");
+    }
+  }
+
 
   async pauseTimer(timerId, { guard } = {}) {
     const timer = await this.guardedActiveTimer(timerId, guard);
@@ -614,17 +825,198 @@ export class FreshBooksService {
     const { project, abilities } = await this.timerProject(timer.projectId);
     const selectedService = selectProjectService(project, timer.serviceId);
     assertTrackableProject(project, selectedService, abilities);
-    return this.stopAndLogTimer(timer, before, "timer-log");
+    return this.stopAndLogTimer(timer, before, "timer-log", {
+      project,
+      service: selectedService,
+    });
   }
 
-  async stopAndLogTimer(timer, before, mutationKind) {
+  async finalizeContinuation(timer, before, link, validatedAssignment = null) {
+    let { project, service } = validatedAssignment || {};
+    if (!project || !service) {
+      const target = await this.timerProject(timer.projectId);
+      project = target.project;
+      service = selectProjectService(project, timer.serviceId);
+      assertTrackableProject(project, service, target.abilities);
+    }
+    const assignment = timeEntryAssignment(project, service);
+    const businessId = await this.businessId();
+    const source = timer._continuedSegments.find((entry) =>
+      String(entry.id) === String(link.sourceEntryId));
+    if (!source) {
+      throw new CliError("The continuation source is not present in the logical timer", {
+        code: "CONTINUATION_ENTRY_CHANGED",
+      });
+    }
+
+    let stopped = timer;
+    let pauseConfirmed = false;
+    if (timer.running) {
+      stopped = await this.pauseTimerState(timer);
+      pauseConfirmed = true;
+    }
+    const nativeSegments = stopped._segments;
+    const expectedDelta = nativeSegments.reduce(
+      (total, segment) => total + Math.max(0, Number(segment.duration) || 0),
+      0,
+    );
+    const loggingPhase = {
+      phase: "logging-native",
+      expectedNativeSeconds: expectedDelta,
+      nativeSegmentIds: nativeSegments.map((segment) => String(segment.id)),
+    };
+    try {
+      await this.writeContinuationLink(businessId, timer.id, {
+        ...link,
+        finalization: loggingPhase,
+      });
+    } catch (error) {
+      if (pauseConfirmed) throw continuationFinalizationPartial(timer.id, "logging-native", error);
+      throw error;
+    }
+
+    let logged;
+    try {
+      const payload = await this.client.request(`/comments/business/${businessId}/timers/${timer.id}`, {
+        method: "PUT",
+        body: {
+          timer: {
+            time_entries: nativeSegments.map((segment) =>
+              timerEntryFields({ ...segment, id: undefined })),
+          },
+        },
+      });
+      logged = confirmedTimerLogEntry(payload, {
+        ...stopped,
+        _continuedSegments: [],
+        _segments: nativeSegments,
+      });
+      if (!logged || String(logged.id) === String(source.id)) {
+        throw new CliError(
+          logged
+            ? "FreshBooks returned the saved source as the native delta"
+            : "FreshBooks did not confirm the native continuation delta",
+          { code: "UNCONFIRMED_TIMER_LOG" },
+        );
+      }
+    } catch (error) {
+      if (!pauseConfirmed && isDefinitiveRejection(error)) {
+        await this.writeContinuationLink(businessId, timer.id, {
+          ...link,
+          finalization: null,
+        });
+        throw error;
+      }
+      throw continuationFinalizationPartial(timer.id, "logging-native", error);
+    }
+
+    const loggedDelta = Math.max(0, Number(logged.duration) || 0);
+    const loggedId = String(logged.id);
+    const sourceDuration = Math.max(0, Number(source.duration) || 0);
+    const nativeLogged = {
+      ...loggingPhase,
+      phase: "native-logged",
+      loggedEntryId: loggedId,
+      loggedSeconds: loggedDelta,
+      sourceDurationSeconds: sourceDuration,
+      targetDurationSeconds: sourceDuration + loggedDelta,
+    };
+    try {
+      await this.writeContinuationLink(businessId, timer.id, {
+        ...link,
+        finalization: nativeLogged,
+      });
+    } catch (error) {
+      throw continuationFinalizationPartial(timer.id, "native-logged", error);
+    }
+
+    let updatedSource;
+    try {
+      await this.writeContinuationLink(businessId, timer.id, {
+        ...link,
+        finalization: { ...nativeLogged, phase: "updating-source" },
+      });
+      const { existing: authoritativeSource } = await this.guardedTimeEntry(
+        source.id,
+        link.sourceToken,
+      );
+      const submitted = Object.assign(
+        writableTimeEntry(authoritativeSource),
+        compact({
+          duration: sourceDuration + loggedDelta,
+          project_id: project.id,
+          ...assignment,
+          note: timer.note,
+        }),
+      );
+      await this.client.request(
+        `/timetracking/business/${businessId}/time_entries/${source.id}`,
+        { method: "PUT", body: { time_entry: submitted } },
+      );
+      updatedSource = await this.timeEntry(source.id);
+      if (!isConfirmedFinalSource(
+        updatedSource,
+        submitted,
+        source.id,
+        timer,
+        sourceDuration + loggedDelta,
+        this.requireTracking().timezone,
+      )) {
+        throw new CliError("FreshBooks did not confirm the aggregate saved entry", {
+          code: "UNCONFIRMED_CONTINUATION_ENTRY",
+        });
+      }
+    } catch (error) {
+      throw continuationFinalizationPartial(timer.id, "updating-source", error);
+    }
+
+    try {
+      await this.writeContinuationLink(businessId, timer.id, {
+        ...link,
+        finalization: { ...nativeLogged, phase: "deleting-intermediate" },
+      });
+      await this.deleteTimeEntryRecord(loggedId);
+    } catch (error) {
+      throw continuationFinalizationPartial(timer.id, "deleting-intermediate", error);
+    }
+    try {
+      await this.writeContinuationLink(businessId, timer.id, null);
+    } catch (error) {
+      throw continuationFinalizationPartial(timer.id, "clearing-link", error);
+    }
+
+    const context = this.requireTracking();
+    const confirmed = context.remember(canonicalTimeEntry(updatedSource, {
+      timezone: context.timezone,
+    }));
+    const intermediate = canonicalTimeEntry(logged, { timezone: context.timezone });
+    const intermediateDeleted = context.remember(canonicalDeleted("time-entry", loggedId));
+    const timerDeleted = context.remember(canonicalDeleted("active-timer", timer.id));
+    return receipt("timer-log", [{
+      scope: recordScope(confirmed),
+      before: { token: link.sourceToken },
+      after: { record: confirmed },
+    }, {
+      scope: recordScope(intermediateDeleted),
+      before: { token: intermediate.token },
+      after: { deleted: true },
+    }, {
+      scope: recordScope(timerDeleted),
+      before: { token: before.token },
+      after: { deleted: true },
+    }], [confirmed, intermediateDeleted, timerDeleted]);
+  }
+  async stopAndLogTimer(timer, before, mutationKind, validatedAssignment = null) {
+    const continuation = await this.continuationLink(timer.id);
+    if (continuation) {
+      return this.finalizeContinuation(timer, before, continuation, validatedAssignment);
+    }
     const paused = timer.running;
     const stoppedTimer = paused ? await this.pauseTimerState(timer) : timer;
     try {
       return await this.logTimerState(stoppedTimer, before, mutationKind);
     } catch (error) {
-      if (paused) throw ambiguousMutation(error, mutationKind);
-      throw error;
+      throw ambiguousMutation(error, mutationKind);
     }
   }
 
@@ -647,16 +1039,53 @@ export class FreshBooksService {
     }
     const context = this.requireTracking();
     const confirmed = context.remember(canonicalTimeEntry(logged, { timezone: context.timezone }));
-    const deleted = canonicalDeleted("active-timer", timer.id);
-    return receipt("timer-log", [{
-      scope: recordScope(confirmed),
-      before: { absent: true },
-      after: { record: confirmed },
-    }, {
+    const changes = [];
+    const results = [confirmed];
+    const confirmedPredecessor = timer._continuedSegments.find(
+      (segment) => String(segment.id) === confirmed.id,
+    );
+    if (confirmedPredecessor) {
+      const previous = canonicalTimeEntry(confirmedPredecessor, { timezone: context.timezone });
+      changes.push({
+        scope: recordScope(confirmed),
+        before: { token: previous.token },
+        after: { record: confirmed },
+      });
+    } else {
+      changes.push({
+        scope: recordScope(confirmed),
+        before: { absent: true },
+        after: { record: confirmed },
+      });
+    }
+    for (const predecessor of timer._continuedSegments) {
+      if (String(predecessor.id) === confirmed.id) continue;
+      const previous = canonicalTimeEntry(predecessor, { timezone: context.timezone });
+      try {
+        const retained = await this.timeEntry(predecessor.id);
+        throw new CliError("FreshBooks retained a saved entry after consolidating its timer", {
+          code: "UNCONFIRMED_TIMER_LOG",
+          details: { entryId: String(retained?.id ?? predecessor.id) },
+        });
+      } catch (error) {
+        if (error?.status !== 404) throw ambiguousMutation(error, mutationKind);
+      }
+      const predecessorDeleted = context.remember(canonicalDeleted("time-entry", predecessor.id));
+      changes.push({
+        scope: recordScope(predecessorDeleted),
+        before: { token: previous.token },
+        after: { deleted: true },
+      });
+      results.push(predecessorDeleted);
+    }
+    const deleted = context.remember(canonicalDeleted("active-timer", timer.id));
+    changes.push({
       scope: recordScope(deleted),
       before: { token: before.token },
       after: { deleted: true },
-    }], [confirmed, deleted]);
+    });
+    results.push(deleted);
+    return receipt("timer-log", changes, results);
   }
 
   async switchTimer(timerId, fields, { guard } = {}) {
@@ -722,11 +1151,15 @@ export class FreshBooksService {
   async discardTimer(timerId, { guard } = {}) {
     const timer = await this.guardedActiveTimer(timerId, guard);
     const before = this.currentTimerRecord(timer);
+    const continuation = await this.continuationLink(timer.id);
     let confirmedWrites = 0;
     try {
       for (const segment of timer._segments) {
         await this.deleteTimeEntryRecord(segment.id);
         confirmedWrites += 1;
+      }
+      if (continuation) {
+        await this.writeContinuationLink(await this.businessId(), timer.id, null);
       }
       const deleted = this.requireTracking().remember(canonicalDeleted("active-timer", timer.id));
       return receipt("timer-discard", [{
@@ -793,6 +1226,35 @@ export class FreshBooksService {
     context.remember(current);
     return timer;
   }
+  async continuationEntry(entryId, entryGuard) {
+    let existing;
+    try {
+      existing = await this.timeEntry(entryId);
+    } catch (error) {
+      if (error?.status === 404) {
+        throw continuationEntryChanged(
+          entryGuard,
+          canonicalDeleted("time-entry", entryId),
+        );
+      }
+      throw error;
+    }
+    if (existing?.active === false) {
+      throw continuationEntryChanged(
+        entryGuard,
+        canonicalDeleted("time-entry", entryId),
+      );
+    }
+    const context = this.requireTracking();
+    const current = context.remember(canonicalTimeEntry(existing, {
+      timezone: context.timezone,
+    }));
+    if (entryGuard !== current.token) {
+      throw continuationEntryChanged(entryGuard, current);
+    }
+    return { existing, current };
+  }
+
   async guardedTimeEntry(entryId, guard) {
     requireMutationGuard(guard);
     let existing;
@@ -804,6 +1266,9 @@ export class FreshBooksService {
       }
       throw error;
     }
+    if (existing?.active === false) {
+      assertGuard(guard, canonicalDeleted("time-entry", entryId));
+    }
     const context = this.requireTracking();
     const current = context.remember(canonicalTimeEntry(existing, {
       timezone: context.timezone,
@@ -813,8 +1278,8 @@ export class FreshBooksService {
   }
 
   async guardedActiveTimer(timerId, guard) {
-    let timer;
     requireTimerMutationGuard(timerId, guard);
+    let timer;
     try {
       timer = await this.activeTimer(timerId);
     } catch (error) {
@@ -837,6 +1302,38 @@ export class FreshBooksService {
     return current;
   }
 
+  async continuationLinks(businessId = undefined) {
+    const id = String(businessId ?? await this.businessId());
+    const config = await this.configStore.read();
+    return config.timerContinuations?.[id] || {};
+  }
+
+  async continuationLink(timerId) {
+    const links = await this.continuationLinks();
+    return links[String(timerId)] || null;
+  }
+
+  async writeContinuationLink(businessId, timerId, link) {
+    const config = await this.configStore.read();
+    const businessKey = String(businessId);
+    const timerKey = String(timerId);
+    const timerContinuations = { ...(config.timerContinuations || {}) };
+    const businessLinks = { ...(timerContinuations[businessKey] || {}) };
+    if (link == null) delete businessLinks[timerKey];
+    else businessLinks[timerKey] = {
+      sourceEntryId: String(link.sourceEntryId),
+      sourceToken: String(link.sourceToken),
+      finalization: link.finalization ?? null,
+    };
+    if (Object.keys(businessLinks).length === 0) delete timerContinuations[businessKey];
+    else timerContinuations[businessKey] = businessLinks;
+    await this.configStore.update({
+      timerContinuations: Object.keys(timerContinuations).length === 0
+        ? undefined
+        : timerContinuations,
+    });
+  }
+
   requireTracking() {
     if (!this.trackingContext) {
       throw new CliError("Canonical tracking context is required", {
@@ -846,6 +1343,133 @@ export class FreshBooksService {
     return this.trackingContext;
   }
 
+}
+
+function continuationEntryChanged(expectedToken, current) {
+  return new CliError("The saved time entry changed since it was loaded", {
+    code: "CONTINUATION_ENTRY_CHANGED",
+    details: {
+      identity: { kind: "time-entry", id: current.id },
+      expectedToken,
+      currentToken: current.token,
+      current,
+    },
+  });
+}
+
+function continuationTimerChanged(timerId, expectedToken, active, current = null) {
+  return new CliError("The active timer changed before the saved entry could continue", {
+    code: "CONTINUATION_TIMER_CHANGED",
+    details: {
+      identity: { kind: "active-timer", id: timerId == null ? null : String(timerId) },
+      expectedToken: expectedToken ?? null,
+      currentToken: current?.token ?? null,
+      current,
+      activeTimerIds: active.map((timer) => String(timer.id)),
+    },
+  });
+}
+
+function continuationPartialState(timerId, continuation, outcomeUnknown = true) {
+  return new CliError("Continuation finalization has a recorded partial phase", {
+    code: "CONTINUATION_FINALIZATION_PARTIAL",
+    outcomeUnknown,
+    details: {
+      timerId: String(timerId),
+      sourceEntryId: String(continuation.sourceEntryId),
+      finalization: continuation.finalization,
+    },
+  });
+}
+
+function continuationFieldEqual(actual, expected) {
+  if (actual === expected) return true;
+  if (actual == null || expected == null) return false;
+  if (typeof actual === "object" || typeof expected === "object") {
+    return JSON.stringify(actual) === JSON.stringify(expected);
+  }
+  return String(actual) === String(expected);
+}
+
+
+function continuationSourceForTimer(source, timerId) {
+  return {
+    ...source,
+    timer: { id: Number(timerId), is_running: false },
+    _continuationSource: true,
+  };
+}
+
+function isConfirmedFinalSource(
+  candidate,
+  submitted,
+  sourceId,
+  timer,
+  targetDuration,
+  timezone,
+) {
+  if (!candidate || String(candidate.id) !== String(sourceId) || candidate.is_logged !== true) {
+    return false;
+  }
+  const current = canonicalTimeEntry(candidate, { timezone });
+  if (current.billed === true
+    || current.durationSeconds !== Number(targetDuration)
+    || current.projectId !== String(timer.projectId)
+    || current.clientId !== (timer.clientId == null ? null : String(timer.clientId))
+    || current.serviceId !== String(timer.serviceId)
+    || current.note !== (timer.note ?? "")
+    || current.billable !== timer.billable) {
+    return false;
+  }
+  return Object.entries(submitted).every(([field, expected]) =>
+    expected === undefined || continuationFieldEqual(candidate[field], expected));
+}
+
+function isDefinitiveRejection(error) {
+  return error?.outcomeUnknown !== true
+    && Number.isInteger(error?.status)
+    && error.status >= 400
+    && error.status < 500
+    && error.status !== 408;
+}
+
+function continuationFinalizationPartial(timerId, phase, error) {
+  return new CliError("Continuation finalization stopped with durable partial state", {
+    code: "CONTINUATION_FINALIZATION_PARTIAL",
+    outcomeUnknown: true,
+    details: {
+      timerId: String(timerId),
+      phase,
+      cause: {
+        code: error?.code || "UNEXPECTED_ERROR",
+        message: error instanceof Error ? error.message : String(error),
+      },
+    },
+  });
+}
+
+function continuationOpenFromRecord(timer, source) {
+  const open = timer.segments.find((segment) =>
+    segment.logged === false && segment.durationSeconds === null);
+  if (!open) {
+    throw new CliError("FreshBooks did not return the new open timer segment", {
+      code: "TIMER_RECONCILIATION_FAILED",
+    });
+  }
+  return {
+    ...source,
+    id: open.id,
+    project_id: timer.projectId,
+    client_id: timer.clientId,
+    service_id: timer.serviceId,
+    note: timer.note,
+    billable: timer.billable,
+    is_logged: false,
+    duration: null,
+    started_at: open.startedAt,
+    local_started_at: null,
+    timer: { id: Number(timer.id), is_running: true },
+  };
 }
 
 export function writableTimeEntry(entry) {
@@ -881,8 +1505,10 @@ function confirmedTimerLogEntry(payload, timer) {
     .concat(timer._segments)
     .reduce((total, segment) => total + Math.max(0, Number(segment.duration) || 0), 0);
   const matching = entries.filter((entry) => {
+    const loggedDuration = Number(entry?.duration);
+    const roundedDuration = Math.round(expectedDuration / 60) * 60;
     if (entry?.id == null
-      || Number(entry.duration) !== expectedDuration
+      || (loggedDuration !== expectedDuration && loggedDuration !== roundedDuration)
       || Number.isNaN(new Date(entry.started_at).getTime())) {
       return false;
     }
@@ -1029,6 +1655,15 @@ function presentTimerSegment(segment) {
     durationSeconds: segment.duration == null ? null : Math.max(0, Number(segment.duration) || 0),
     running: segment.is_logged === false && segment.duration == null,
     isLogged: segment.is_logged === true,
+  };
+}
+
+function timeEntryAssignment(project, service) {
+  return {
+    client_id: project.client_id ?? null,
+    service_id: service?.id ?? null,
+    billable: project.internal === true ? false : service?.billable === true,
+    internal: project.internal === true,
   };
 }
 

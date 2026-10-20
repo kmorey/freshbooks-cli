@@ -86,13 +86,52 @@ freshbooks timer correct --id 456 --duration 1h30m --guard GUARD_TOKEN
 freshbooks timer log --id 456 --guard GUARD_TOKEN
 ```
 
-`timer status` groups Time Entries by timer identity and only exposes groups that still contain an unlogged segment. For low-latency desktop polling it treats FreshBooks' first `include_unlogged` page as the complete timer set; this can miss an older paused timer or additional timer that FreshBooks places on a later page. A pause closes the current unlogged segment; resume adds another segment to the same logical timer. Logging a running timer stops its open segment before logging the timer resource. A canonical active timer includes all timer segments present on that page, including logged continuation predecessors, while writes remain limited to active segments. `timer start` refuses to create another logical timer when one is found.
+`timer status` groups Time Entries by timer identity and only exposes groups that still contain an unlogged segment. For low-latency desktop polling it treats FreshBooks' first `include_unlogged` page as the complete timer set; this can miss an older paused timer or additional timer that FreshBooks places on a later page. A pause closes the current unlogged segment; resume adds another segment to the same native timer. Logging a running timer stops its open segment before logging the timer resource. Saved-entry continuations also include their authoritatively re-read source through the durable linkage described below. `timer start` refuses to create another logical timer when one is found.
 
 Starting a timer derives client, internal, and billability fields from the selected project and service. Switching logs the current timer before starting the next one:
 
 ```bash
 freshbooks timer switch --id 456 --guard GUARD_TOKEN --project 23456 --service 78901
 ```
+
+Continue a saved entry from its existing duration rather than starting at zero:
+
+```bash
+freshbooks timer continue --entry 98765 --entry-guard ENTRY_TOKEN
+# If a different timer is active, confirm its identity and current guard too:
+freshbooks timer continue --entry 98765 --entry-guard ENTRY_TOKEN --id 456 --guard TIMER_TOKEN
+```
+
+FreshBooks rejects resuming a logged timer and does not reassign a saved entry to
+another timer. Continuation therefore creates a new native timer and records a
+business-scoped source-entry ID and guard in `timerContinuations` in `config.json`.
+Keep this configuration when reinstalling or moving the CLI. The saved entry stays
+unchanged; status re-reads it and adds its duration to the new timer's elapsed
+segments. FreshBooks' web/mobile timer shows the new portion; the CLI and plugin
+show the cumulative duration.
+
+Successful Save logs the native portion, adds its authoritative duration to the
+original saved entry, confirms that update, and deletes the intermediate logged
+entry. The original entry ID is retained. The source update explicitly sends the
+validated project/service's client, billability, and internal fields:
+FreshBooks' public update endpoint can clear omitted assignment fields instead of
+deriving them. FreshBooks' nearest-minute timer-log rounding is accepted; the CLI
+does not round the source a second time. Discard removes only new native segments
+and their local linkage.
+
+Changed, missing, deleted (`active: false`), or billed source entries are refused
+before writes. Switching must finish the previous timer's save before starting
+another continuation. An already-active source must use pause/resume instead.
+Partial finalization phases and their evidence remain in configuration for
+reconciliation; they are never automatically replayed. A config persistence failure
+after a confirmed remote write is also an unknown outcome: remaining writes stop,
+and any previously persisted phase remains available for reconciliation.
+Retained links whose native
+timer is no longer active do not block discovery or an unrelated new timer.
+Mutations targeting the affected timer still refuse the unresolved finalization.
+A complete positive observation can resolve a pending continuation without deletion
+coverage, but a missing match cannot prove that a multi-write start did nothing.
+Diagnostics advertises `timer-continuation`.
 
 Discard is destructive and requires both the current guard and explicit confirmation:
 
@@ -109,7 +148,7 @@ freshbooks time update 98765 --guard GUARD_TOKEN --date 2026-09-03 --duration 1h
 freshbooks time delete 98765 --guard GUARD_TOKEN --yes
 ```
 
-Calendar dates use the configured FreshBooks timezone, including daylight-saving transitions. Set `FRESHBOOKS_TIMEZONE` to the account's IANA timezone (for example, `America/Chicago`) when it differs from the machine timezone. Entry creation derives client, internal, and billability fields from the selected FreshBooks project service. Guarded assignment changes preserve all non-derived fields in the single update, omit stale client/internal/billability values so FreshBooks can validate and derive the new assignment, and canonicalize the confirmed response.
+Calendar dates use the configured FreshBooks timezone, including daylight-saving transitions. Set `FRESHBOOKS_TIMEZONE` to the account's IANA timezone (for example, `America/Chicago`) when it differs from the machine timezone. Entry creation and guarded assignment changes derive client, internal, and billability fields from the selected FreshBooks project service. Assignment changes validate that project/service and explicitly send the derived fields, preserving unrelated entry fields and canonicalizing the confirmed response. FreshBooks' public update endpoint must not be assumed to derive omitted assignment fields.
 
 ## Quickshell contract
 

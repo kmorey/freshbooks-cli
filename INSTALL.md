@@ -55,6 +55,20 @@ freshbooks --help
 
 Global npm permissions and command locations follow the local Node/npm installation.
 
+For a long-running desktop integration, prefer the user-local installer above.
+Global npm packages belong to a particular Node installation. Switching the
+selected Node version can therefore break a `freshbooks` shim even though Node
+itself still works. The user-local installation keeps application files outside
+those version-specific package directories and uses the available Node.js 22+
+runtime.
+
+When migrating, verify `~/.local/bin/freshbooks --version` before removing the old
+global registrations. A version-manager shim earlier on `PATH` can shadow the new
+launcher; remove obsolete CLI registrations from the relevant Node installations
+and regenerate shims (`mise reshim` for Mise). Preserve `~/.config/freshbooks-cli`.
+Verify diagnostics from the desktop shell's environment and home directory, not
+only a development terminal.
+
 ## Agent procedure
 
 Use this sequence when an agent is installing the CLI on someone else's machine:
